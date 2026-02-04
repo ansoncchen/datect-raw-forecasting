@@ -1,0 +1,19 @@
+# .ralphrc - Ralph project configuration
+
+PROJECT_NAME="datect-raw-forecasting"
+PROJECT_TYPE="python"
+
+MAX_CALLS_PER_HOUR=100
+CLAUDE_TIMEOUT_MINUTES=30
+CLAUDE_OUTPUT_FORMAT="text"
+
+ALLOWED_TOOLS="Write,Read,Edit,Bash(git *),Bash(python3 *),Bash(pip *),Bash(pip3 *),Bash(pytest *),Bash(ls *),Bash(cd *),Bash(cat *),Bash(head *),Bash(tail *)"
+
+SESSION_CONTINUITY=true
+SESSION_EXPIRY_HOURS=24
+
+TASK_SOURCES="local"
+
+CB_NO_PROGRESS_THRESHOLD=5
+CB_SAME_ERROR_THRESHOLD=7
+CB_OUTPUT_DECLINE_THRESHOLD=70

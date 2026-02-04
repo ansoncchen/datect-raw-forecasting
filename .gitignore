@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.DS_Store
+logs/
+raw_validation_plots/
+data/processed/
+data/raw/
