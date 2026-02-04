@@ -62,17 +62,16 @@ except ImportError:
 # CONFIGURATION
 # =============================================================================
 
-# Number of random raw measurements to test on
-N_TEST_SAMPLES = 500
-
 # Minimum training samples required before making a prediction
 MIN_TRAINING_SAMPLES = 10
 
 # Forecast horizon (how far ahead we're predicting)
 FORECAST_HORIZON_DAYS = config.FORECAST_HORIZON_DAYS  # 7 days (1 week)
 
-# Minimum date for test samples (need enough history to train)
-MIN_TEST_DATE = "2008-01-01"
+# Minimum date for test samples (need enough history to train).
+# We now rely primarily on a per-site history fraction rule (see run_validation),
+# so this is just a very early lower bound.
+MIN_TEST_DATE = "2003-01-01"
 
 # Spike threshold for binary classification metrics
 SPIKE_THRESHOLD = config.SPIKE_THRESHOLD  # 20 μg/g
@@ -288,7 +287,9 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params):
         site,
         test_date,
         anchor_date,
-        max_date_diff_days=14,
+        # Allow a looser tolerance between raw test date and
+        # nearest processed environmental row to reduce dropouts.
+        max_date_diff_days=28,
     )
     if test_row is None:
         return None
@@ -379,7 +380,7 @@ def tune_xgb_params(calib_rows, feature_frame, base_params):
     return best_params, best_r2
 
 
-def run_validation(raw_data, processed_data, n_samples=N_TEST_SAMPLES):
+def run_validation(raw_data, processed_data, n_samples=None):
     """
     Run validation on a random sample of raw measurements.
     """
@@ -398,23 +399,47 @@ def run_validation(raw_data, processed_data, n_samples=N_TEST_SAMPLES):
         except Exception as e:
             print(f"Warning: TFT training failed: {e}")
 
-    # Filter to valid test dates
+    # Filter to valid test dates (very early lower bound)
     min_test_date = pd.Timestamp(MIN_TEST_DATE)
-    valid_raw = raw_data[raw_data['date'] >= min_test_date].copy()
+    candidate_raw = raw_data[raw_data['date'] >= min_test_date].copy()
+
+    # Pre-compute total raw measurement counts per site
+    site_total_counts = raw_data.groupby("site")["date"].size().to_dict()
+
+    print(f"Raw measurements after {MIN_TEST_DATE}: {len(candidate_raw)}")
     
-    print(f"Raw measurements after {MIN_TEST_DATE}: {len(valid_raw)}")
-    
-    # Further filter: need enough history in processed data
+    # Further filter: need enough history in processed data AND
+    # at least 20% of each site's raw measurements to lie on/before
+    # the anchor date for that test point.
     valid_for_testing = []
-    for _, row in valid_raw.iterrows():
+    for _, row in candidate_raw.iterrows():
         anchor_date = row['date'] - pd.Timedelta(days=FORECAST_HORIZON_DAYS)
+        site = row["site"]
+
+        # How many raw measurements for this site exist up to anchor_date?
+        total_site_raw = site_total_counts.get(site, 0)
+        if total_site_raw == 0:
+            continue
+        min_required_history_raw = int(np.ceil(0.2 * total_site_raw))
+        # enforce at least MIN_TRAINING_SAMPLES raw points as well
+        min_required_history_raw = max(min_required_history_raw, MIN_TRAINING_SAMPLES)
+
+        site_raw_history_count = len(
+            raw_data[
+                (raw_data["site"] == site) &
+                (raw_data["date"] <= anchor_date)
+            ]
+        )
+        if site_raw_history_count < min_required_history_raw:
+            continue
+
         site_history = feature_frame[
-            (feature_frame['site'] == row['site']) &
+            (feature_frame['site'] == site) &
             (feature_frame['date'] <= anchor_date) &
             (feature_frame['da_raw'].notna())
         ]
         site_future = feature_frame[
-            (feature_frame['site'] == row['site']) &
+            (feature_frame['site'] == site) &
             (feature_frame['date'] > anchor_date)
         ]
         if len(site_history) >= MIN_TRAINING_SAMPLES and len(site_future) > 0:
@@ -426,14 +451,45 @@ def run_validation(raw_data, processed_data, n_samples=N_TEST_SAMPLES):
     if len(valid_for_testing) == 0:
         print("ERROR: No valid test samples found!")
         return None
-    
-    # Random sample
-    random.seed(RANDOM_SEED)
-    n_samples = min(n_samples, len(valid_for_testing))
-    test_indices = random.sample(range(len(valid_for_testing)), n_samples)
-    test_samples = valid_for_testing.iloc[test_indices]
-    
-    print(f"Selected {n_samples} random raw measurements for validation")
+
+    # ------------------------------------------------------------------
+    # Per-site sampling: use ~20% of valid measurements per site
+    # (with at least 1 sample per site), all after MIN_TEST_DATE.
+    # ------------------------------------------------------------------
+    rng = np.random.RandomState(RANDOM_SEED)
+    per_site_counts = {}
+    sampled_rows = []
+    for site, site_df in valid_for_testing.groupby("site"):
+        site_df = site_df.sort_values("date")
+        n_site_candidates = len(site_df)
+        if n_site_candidates == 0:
+            continue
+
+        # Target ~30% of the *total* raw measurements for this site
+        total_site_raw = site_total_counts.get(site, n_site_candidates)
+        target_per_site = int(np.ceil(0.3 * total_site_raw))
+
+        # But we can only draw from candidates that satisfy the 20% history rule.
+        n_site_samples = min(target_per_site, n_site_candidates)
+        if n_site_samples <= 0:
+            continue
+
+        indices = rng.choice(n_site_candidates, size=n_site_samples, replace=False)
+        per_site_counts[site] = n_site_samples
+        sampled_rows.append(site_df.iloc[indices])
+
+    if not sampled_rows:
+        print("ERROR: Per-site sampling produced no test samples!")
+        return None
+
+    test_samples = pd.concat(sampled_rows, ignore_index=True)
+    n_samples = len(test_samples)
+
+    print("\nPer-site test sample counts (~30% of total raw measurements, subject to history constraints):")
+    for site, count in sorted(per_site_counts.items()):
+        print(f"  {site}: {count}")
+
+    print(f"\nTotal selected test measurements: {n_samples}")
     print(f"Test date range: {test_samples['date'].min().date()} to {test_samples['date'].max().date()}")
     
     # XGBoost parameters (matching config)
@@ -469,8 +525,12 @@ def run_validation(raw_data, processed_data, n_samples=N_TEST_SAMPLES):
     calib_rows = [sample_rows[i] for i in calib_idx]
     eval_rows = [sample_rows[i] for i in eval_idx]
 
+    print(f"\nData split (CALIBRATION_FRACTION={CALIBRATION_FRACTION}):")
+    print(f"  Calibration set (for hyperparameter tuning): {len(calib_rows)} samples ({100*CALIBRATION_FRACTION:.0f}%)")
+    print(f"  Evaluation set (for final metrics):         {len(eval_rows)} samples ({100*(1-CALIBRATION_FRACTION):.0f}%)")
+
     best_params, best_r2 = tune_xgb_params(calib_rows, feature_frame, base_params)
-    print(f"Best XGBoost params (calib R²={best_r2:.3f}): {best_params}")
+    print(f"\nBest XGBoost params (calib R²={best_r2:.3f}): {best_params}")
 
     if ENABLE_PARALLEL:
         results = Parallel(n_jobs=N_JOBS)(
@@ -485,7 +545,7 @@ def run_validation(raw_data, processed_data, n_samples=N_TEST_SAMPLES):
 
     results = [r for r in results if r is not None]
 
-    print(f"\nSuccessful predictions: {len(results)} / {n_samples}")
+    print(f"\nEvaluation set results: {len(results)} / {len(eval_rows)} successful predictions ({100*len(results)/len(eval_rows):.1f}%)")
 
     results_df = pd.DataFrame(results)
     if results_df.empty:
@@ -1106,7 +1166,7 @@ def save_results(results_df, metrics, output_dir):
         
         f.write("CONFIGURATION\n")
         f.write(f"  Forecast horizon: {FORECAST_HORIZON_DAYS} days\n")
-        f.write(f"  Test samples: {N_TEST_SAMPLES}\n")
+        f.write("  Test sampling: ~30% per site with 20% history requirement\n")
         f.write(f"  Min training samples: {MIN_TRAINING_SAMPLES}\n")
         f.write(f"  Min test date: {MIN_TEST_DATE}\n")
         f.write(f"  Spike threshold: {SPIKE_THRESHOLD} μg/g\n")
@@ -1153,7 +1213,7 @@ def main():
     print(f"")
     print(f"Configuration:")
     print(f"  - Forecast horizon: {FORECAST_HORIZON_DAYS} days")
-    print(f"  - Test samples: {N_TEST_SAMPLES}")
+    print(f"  - Test sampling: ~30% of each site's raw measurements (with 20% history requirement)")
     print(f"  - Min training samples: {MIN_TRAINING_SAMPLES}")
     print(f"  - Min test date: {MIN_TEST_DATE}")
     print(f"  - Spike threshold: {SPIKE_THRESHOLD} μg/g")
@@ -1165,7 +1225,7 @@ def main():
     processed_data = load_processed_data()
     
     # Run validation
-    results_df = run_validation(raw_data, processed_data, n_samples=N_TEST_SAMPLES)
+    results_df = run_validation(raw_data, processed_data)
     
     if results_df is not None and not results_df.empty:
         # Calculate and display metrics
