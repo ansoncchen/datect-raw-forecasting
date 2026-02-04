@@ -30,7 +30,6 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import MinMaxScaler
-from xgboost import XGBRegressor
 from joblib import Parallel, delayed
 from tqdm import tqdm
 import warnings
@@ -38,6 +37,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import config
+from forecasting.model_factory import build_xgb_regressor
 from forecasting.raw_data_forecaster import (
     aggregate_raw_to_weekly,
     build_raw_feature_frame,
@@ -45,7 +45,9 @@ from forecasting.raw_data_forecaster import (
     get_site_test_row,
     get_site_training_frame,
     fit_tft_on_raw,
+    recompute_test_row_persistence_features,
 )
+from forecasting.sample_weights import compute_spike_focused_weights
 
 # Try to import plotly for visualizations
 try:
@@ -85,6 +87,9 @@ PLOTS_OUTPUT_DIR = "./raw_validation_plots"
 # Optional TFT usage (can be slow)
 ENABLE_TFT = False
 
+# Optional quantile prediction intervals (extra models per sample)
+ENABLE_QUANTILE_INTERVALS = True
+
 # Stabilization settings
 USE_LOG_TARGET = True
 PREDICTION_CLIP_Q = 0.99
@@ -94,7 +99,7 @@ ENABLE_PARALLEL = True
 N_JOBS = -1  # Use all cores
 
 # Calibration/tuning
-CALIBRATION_FRACTION = 0.5  # 50% for tuning, 50% for evaluation
+CALIBRATION_FRACTION = 0.7  # 50% for tuning, 50% for evaluation
 PARAM_GRID = [
     {"max_depth": 4, "n_estimators": 500, "learning_rate": 0.05, "min_child_weight": 5},
     {"max_depth": 5, "n_estimators": 600, "learning_rate": 0.03, "min_child_weight": 5},
@@ -219,6 +224,10 @@ def add_temporal_features(df):
         df['sin_month'] = np.sin(2 * np.pi * df['month'] / 12)
         df['cos_month'] = np.cos(2 * np.pi * df['month'] / 12)
         df['quarter'] = df['date'].dt.quarter
+        week_of_year = df['date'].dt.isocalendar().week.astype(int)
+        df['sin_week_of_year'] = np.sin(2 * np.pi * week_of_year / 52)
+        df['cos_week_of_year'] = np.cos(2 * np.pi * week_of_year / 52)
+        df['is_bloom_season'] = df['month'].between(3, 10).astype(int)
         df['days_since_start'] = (df['date'] - df['date'].min()).dt.days
     else:
         df['month'] = df['date'].dt.month
@@ -231,10 +240,12 @@ def create_transformer(df, drop_cols):
     """Create preprocessing transformer (matching main pipeline)."""
     X = df.drop(columns=drop_cols, errors='ignore')
     numeric_cols = X.select_dtypes(include=[np.number]).columns
-    
+    # Drop columns that are all NaN so median imputation can run without warnings
+    numeric_cols = [c for c in numeric_cols if X[c].notna().any()]
+
     if len(numeric_cols) == 0:
         raise ValueError("No numeric features available")
-    
+
     numeric_pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', MinMaxScaler()),
@@ -293,7 +304,12 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params):
     )
     if test_row is None:
         return None
-    
+
+    # Recompute persistence features using only train_data (no target leakage)
+    test_row = recompute_test_row_persistence_features(
+        test_row, train_data, SPIKE_THRESHOLD
+    )
+
     # Add temporal features to both
     train_data = add_temporal_features(train_data)
     test_row = add_temporal_features(test_row)
@@ -304,9 +320,19 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params):
     try:
         # Create transformer and fit on training data only
         transformer, X_train = create_transformer(train_data, drop_cols)
-        y_train = train_data['da_raw'].astype(float)
+        y_train_raw = train_data['da_raw'].astype(float)
+        y_train = y_train_raw.copy()
         if USE_LOG_TARGET:
             y_train = np.log1p(y_train)
+
+        sample_weight = None
+        if config.USE_REGRESSION_SAMPLE_WEIGHTS:
+            sample_weight = compute_spike_focused_weights(
+                y_train_raw,
+                SPIKE_THRESHOLD,
+                config.SPIKE_FALSE_NEGATIVE_WEIGHT,
+                config.SPIKE_TRUE_NEGATIVE_WEIGHT,
+            )
         
         # Fit transformer on training data only
         X_train_processed = transformer.fit_transform(X_train)
@@ -318,18 +344,36 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params):
         X_test_processed = transformer.transform(X_test)
         
         # Train XGBoost on raw targets
-        model = XGBRegressor(**model_params, random_state=RANDOM_SEED, verbosity=0)
-        model.fit(X_train_processed, y_train)
+        model = build_xgb_regressor(model_params)
+        model.fit(X_train_processed, y_train, sample_weight=sample_weight)
         
         # Predict using TEST DATE features
-        prediction = float(model.predict(X_test_processed)[0])
-        if USE_LOG_TARGET:
-            prediction = np.expm1(prediction)
-        prediction = max(0.0, prediction)  # DA can't be negative
+        def _postprocess_prediction(value: float) -> float:
+            if USE_LOG_TARGET:
+                value = np.expm1(value)
+            value = max(0.0, value)
+            if PREDICTION_CLIP_Q is not None:
+                clip_max = float(np.quantile(train_data['da_raw'], PREDICTION_CLIP_Q))
+                value = min(value, clip_max)
+            return float(value)
 
-        if PREDICTION_CLIP_Q is not None:
-            clip_max = float(np.quantile(train_data['da_raw'], PREDICTION_CLIP_Q))
-            prediction = min(prediction, clip_max)
+        prediction = _postprocess_prediction(float(model.predict(X_test_processed)[0]))
+
+        quantile_predictions = {}
+        if ENABLE_QUANTILE_INTERVALS:
+            try:
+                for q in (0.1, 0.5, 0.9):
+                    quantile_params = {
+                        **model_params,
+                        "objective": "reg:quantile",
+                        "quantile_alpha": q,
+                    }
+                    q_model = build_xgb_regressor(quantile_params)
+                    q_model.fit(X_train_processed, y_train, sample_weight=sample_weight)
+                    q_pred = float(q_model.predict(X_test_processed)[0])
+                    quantile_predictions[f"predicted_p{int(q * 100)}"] = _postprocess_prediction(q_pred)
+            except Exception:
+                quantile_predictions = {}
         
         # Naive baseline: last known RAW DA value from training
         naive_prediction = get_last_known_raw_da(train_data)
@@ -347,7 +391,7 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params):
             'training_samples': len(train_data),
             'days_ahead': (test_date - anchor_date).days,
             'date_diff_to_processed': int(abs((test_row['date'].iloc[0] - test_date).days))
-        }
+        } | quantile_predictions
         
     except Exception as e:
         return None
@@ -395,9 +439,25 @@ def run_validation(raw_data, processed_data, n_samples=None):
     if ENABLE_TFT:
         try:
             print("\nAttempting TFT training (this can be slow)...")
-            fit_tft_on_raw(feature_frame)
+            tft_model, tft_dataset = fit_tft_on_raw(feature_frame)
+            tft_pred = tft_model.model.predict(tft_dataset, mode="prediction", return_x=True)
+            if isinstance(tft_pred, tuple):
+                tft_values, tft_x = tft_pred
+                tft_actual = tft_x.get("decoder_target")
+            else:
+                tft_values = tft_pred
+                tft_actual = None
+
+            tft_values = tft_values.detach().cpu().numpy().reshape(-1)
+            if tft_actual is not None:
+                tft_actual = tft_actual.detach().cpu().numpy().reshape(-1)
+                tft_r2 = r2_score(tft_actual, tft_values)
+                tft_mae = mean_absolute_error(tft_actual, tft_values)
+                print(f"TFT baseline (all windows) R²={tft_r2:.3f}, MAE={tft_mae:.3f}")
+            else:
+                print("Warning: TFT predictions returned without targets for comparison.")
         except Exception as e:
-            print(f"Warning: TFT training failed: {e}")
+            print(f"Warning: TFT training/evaluation failed: {e}")
 
     # Filter to valid test dates (very early lower bound)
     min_test_date = pd.Timestamp(MIN_TEST_DATE)
@@ -515,19 +575,30 @@ def run_validation(raw_data, processed_data, n_samples=None):
         for _, row in test_samples.iterrows()
     ]
 
-    # Split for calibration/tuning
+    # Split for calibration/tuning: temporal split with random cutoff (no future leakage)
+    # Calib = earlier dates, Eval = later dates; cutoff percentile randomized for variety
     rng = np.random.RandomState(RANDOM_SEED)
-    indices = np.arange(len(sample_rows))
-    rng.shuffle(indices)
-    split_idx = int(len(indices) * CALIBRATION_FRACTION)
-    calib_idx = indices[:split_idx]
-    eval_idx = indices[split_idx:]
-    calib_rows = [sample_rows[i] for i in calib_idx]
-    eval_rows = [sample_rows[i] for i in eval_idx]
-
-    print(f"\nData split (CALIBRATION_FRACTION={CALIBRATION_FRACTION}):")
-    print(f"  Calibration set (for hyperparameter tuning): {len(calib_rows)} samples ({100*CALIBRATION_FRACTION:.0f}%)")
-    print(f"  Evaluation set (for final metrics):         {len(eval_rows)} samples ({100*(1-CALIBRATION_FRACTION):.0f}%)")
+    sorted_rows = sorted(sample_rows, key=lambda r: r["date"])
+    pct_low = max(0.05, CALIBRATION_FRACTION - 0.05)
+    pct_high = min(0.95, CALIBRATION_FRACTION + 0.05)
+    split_pct = float(rng.uniform(pct_low, pct_high))
+    cutoff_idx = max(1, min(int(len(sorted_rows) * split_pct), len(sorted_rows) - 1))
+    cutoff_date = sorted_rows[cutoff_idx - 1]["date"]
+    calib_rows = [r for r in sorted_rows if r["date"] <= cutoff_date]
+    eval_rows = [r for r in sorted_rows if r["date"] > cutoff_date]
+    # Fallback if all dates identical (would make eval empty)
+    if not calib_rows or not eval_rows:
+        indices = np.arange(len(sample_rows))
+        rng.shuffle(indices)
+        split_idx = max(1, min(int(len(indices) * CALIBRATION_FRACTION), len(indices) - 1))
+        calib_rows = [sample_rows[i] for i in indices[:split_idx]]
+        eval_rows = [sample_rows[i] for i in indices[split_idx:]]
+        print(f"\nData split (random fallback; temporal split yielded empty set):")
+    else:
+        print(f"\nData split (temporal, CALIBRATION_FRACTION target={CALIBRATION_FRACTION}):")
+        print(f"  Cutoff date: {cutoff_date.date()} (percentile ~{100*split_pct:.0f}%)")
+    print(f"  Calibration set (earlier dates, for hyperparameter tuning): {len(calib_rows)} samples")
+    print(f"  Evaluation set (later dates, for final metrics):             {len(eval_rows)} samples")
 
     best_params, best_r2 = tune_xgb_params(calib_rows, feature_frame, base_params)
     print(f"\nBest XGBoost params (calib R²={best_r2:.3f}): {best_params}")
@@ -978,21 +1049,27 @@ def generate_plots(results_df, metrics, output_dir):
             ))
         
         # Spike threshold line
-        fig.add_hline(y=SPIKE_THRESHOLD, line_dash="dash", line_color="red", 
+        fig.add_hline(y=SPIKE_THRESHOLD, line_dash="dash", line_color="red",
                       annotation_text=f"Spike Threshold ({SPIKE_THRESHOLD} μg/g)")
-        
-        # Calculate site metrics
-        site_actual = site_data['actual_da_raw'].values
-        site_pred = site_data['predicted_da'].values
-        site_naive = site_data['naive_prediction'].values
-        site_r2 = r2_score(site_actual, site_pred)
-        site_mae = mean_absolute_error(site_actual, site_pred)
-        naive_r2 = r2_score(site_actual, site_naive)
-        naive_mae = mean_absolute_error(site_actual, site_naive)
-        if 'ensemble_prediction' in site_data.columns:
-            site_ensemble = site_data['ensemble_prediction'].values
-            ens_r2 = r2_score(site_actual, site_ensemble)
-            ens_mae = mean_absolute_error(site_actual, site_ensemble)
+
+        # Use site metrics from calculate_metrics for consistency with printed output
+        site_metrics_dict = metrics.get("site_metrics", {})
+        sm = site_metrics_dict.get(site, {})
+        if sm:
+            site_r2, site_mae = sm.get("r2", 0.0), sm.get("mae", 0.0)
+            naive_r2, naive_mae = sm.get("naive_r2", 0.0), sm.get("naive_mae", 0.0)
+        else:
+            site_actual = site_data["actual_da_raw"].values
+            site_pred = site_data["predicted_da"].values
+            site_naive = site_data["naive_prediction"].values
+            site_r2 = r2_score(site_actual, site_pred)
+            site_mae = mean_absolute_error(site_actual, site_pred)
+            naive_r2 = r2_score(site_actual, site_naive)
+            naive_mae = mean_absolute_error(site_actual, site_naive)
+        if "ensemble_prediction" in site_data.columns:
+            site_ensemble = site_data["ensemble_prediction"].values
+            ens_r2 = r2_score(site_data["actual_da_raw"].values, site_ensemble)
+            ens_mae = mean_absolute_error(site_data["actual_da_raw"].values, site_ensemble)
             title = (
                 f"Time Series Comparison: {site}<br><sub>"
                 f"XGBoost: R²={site_r2:.3f}, MAE={site_mae:.2f} | "

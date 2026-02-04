@@ -26,7 +26,11 @@ KNOWN_REAL_CANDIDATES = [
     "sin_month",
     "cos_month",
     "quarter",
+    "sin_week_of_year",
+    "cos_week_of_year",
+    "is_bloom_season",
     "days_since_start",
+    "weeks_since_last_spike",
 ]
 
 

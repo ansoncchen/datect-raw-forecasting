@@ -26,7 +26,7 @@ logger = get_logger(__name__)
 
 @dataclass
 class RawForecastConfig:
-    lags: Iterable[int] = (1, 2, 3, 52)
+    lags: Iterable[int] = tuple(config.LAG_FEATURES)
     max_date_diff_days: int = 14
 
 
@@ -128,10 +128,34 @@ def build_raw_feature_frame(
     merged["weeks_since_last_raw"] = (merged["date"] - last_obs_date).dt.days / 7.0
     merged["weeks_since_last_raw"] = merged["weeks_since_last_raw"].fillna(999.0)
 
+    last_spike_date = merged["date"].where(merged["da_raw"] > config.SPIKE_THRESHOLD)
+    last_spike_date = last_spike_date.groupby(merged["site"]).ffill()
+    merged["weeks_since_last_spike"] = (merged["date"] - last_spike_date).dt.days / 7.0
+    merged["weeks_since_last_spike"] = merged["weeks_since_last_spike"].fillna(999.0)
+
+    if config.USE_ROLLING_FEATURES:
+        rolling_windows = (4, 8, 12)
+        shifted = merged.groupby("site")["last_observed_da_raw"].shift(1)
+        for window in rolling_windows:
+            rolling_group = shifted.groupby(merged["site"]).rolling(window, min_periods=1)
+            merged[f"raw_obs_roll_mean_{window}"] = (
+                rolling_group.mean().reset_index(level=0, drop=True)
+            )
+            merged[f"raw_obs_roll_std_{window}"] = (
+                rolling_group.std().reset_index(level=0, drop=True)
+            )
+            merged[f"raw_obs_roll_max_{window}"] = (
+                rolling_group.max().reset_index(level=0, drop=True)
+            )
+
     processor = DataProcessor()
     merged = processor.create_raw_lag_features(
         merged, group_col="site", value_col="da_raw", lags=list(cfg.lags)
     )
+    if "da_raw_lag_1" in merged.columns and "da_raw_lag_2" in merged.columns:
+        merged["da_raw_lag_diff_1"] = merged["da_raw_lag_1"] - merged["da_raw_lag_2"]
+    if "da_raw_lag_2" in merged.columns and "da_raw_lag_3" in merged.columns:
+        merged["da_raw_lag_diff_2"] = merged["da_raw_lag_2"] - merged["da_raw_lag_3"]
     return merged
 
 
@@ -152,6 +176,44 @@ def get_site_training_frame(
     if len(train_data) < min_training_samples:
         return None
     return train_data
+
+
+def recompute_test_row_persistence_features(
+    test_row: pd.DataFrame,
+    train_data: pd.DataFrame,
+    spike_threshold: float,
+) -> pd.DataFrame:
+    """
+    Overwrite persistence features in test_row using only data from train_data
+    (date <= anchor_date) to prevent target leakage.
+
+    Only these features can leak the target:
+    - last_observed_da_raw: ffill includes target if measurement exists at test_date
+    - weeks_since_last_raw: would be 0 if target exists
+    - weeks_since_last_spike: would be 0 if target is a spike
+
+    NOTE: Rolling features (raw_obs_roll_*) are computed using shift(1) in
+    build_raw_feature_frame, so they already use only data from T-1 and earlier.
+    We do NOT recompute them here to preserve correct semantics.
+    """
+    if train_data.empty:
+        return test_row
+    test_row = test_row.copy()
+    test_row_date = test_row["date"].iloc[0]
+    # Last known DA and its date (from training data only)
+    last_da = float(train_data["da_raw"].iloc[-1])
+    last_obs_date = train_data["date"].iloc[-1]
+    test_row["last_observed_da_raw"] = last_da
+    test_row["weeks_since_last_raw"] = (test_row_date - last_obs_date).days / 7.0
+    # Last spike date from training only
+    spike_mask = train_data["da_raw"] > spike_threshold
+    if spike_mask.any():
+        last_spike_date = train_data.loc[spike_mask, "date"].max()
+        test_row["weeks_since_last_spike"] = (test_row_date - last_spike_date).days / 7.0
+    else:
+        test_row["weeks_since_last_spike"] = 999.0
+    # NOTE: Do NOT recompute rolling features - they already use shift(1) and don't leak
+    return test_row
 
 
 def get_site_test_row(
