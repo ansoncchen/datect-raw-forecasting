@@ -94,7 +94,7 @@ ENABLE_PARALLEL = True
 N_JOBS = -1  # Use all cores
 
 # Calibration/tuning
-CALIBRATION_FRACTION = 0.7
+CALIBRATION_FRACTION = 0.5  # 50% for tuning, 50% for evaluation
 PARAM_GRID = [
     {"max_depth": 4, "n_estimators": 500, "learning_rate": 0.05, "min_child_weight": 5},
     {"max_depth": 5, "n_estimators": 600, "learning_rate": 0.03, "min_child_weight": 5},
