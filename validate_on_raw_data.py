@@ -95,7 +95,7 @@ ENABLE_PARALLEL = True
 N_JOBS = -1  # Use all cores
 
 # Calibration/tuning
-CALIBRATION_FRACTION = 0.7  # Per-anchor fraction of historical rows for tuning/calibration
+CALIBRATION_FRACTION = 0.3  # Per-anchor fraction of historical rows for tuning/calibration
 PARAM_GRID = [
     {"max_depth": 4, "n_estimators": 500, "learning_rate": 0.05, "min_child_weight": 5},
     {"max_depth": 5, "n_estimators": 600, "learning_rate": 0.03, "min_child_weight": 5},
@@ -501,7 +501,7 @@ def run_validation(raw_data, processed_data, n_samples=None):
     print(f"Raw measurements after {MIN_TEST_DATE}: {len(candidate_raw)}")
     
     # Further filter: need enough history in processed data AND
-    # at least 20% of each site's raw measurements to lie on/before
+    # at least 33% of each site's raw measurements to lie on/before
     # the anchor date for that test point.
     valid_for_testing = []
     for _, row in candidate_raw.iterrows():
@@ -512,7 +512,7 @@ def run_validation(raw_data, processed_data, n_samples=None):
         total_site_raw = site_total_counts.get(site, 0)
         if total_site_raw == 0:
             continue
-        min_required_history_raw = int(np.ceil(0.2 * total_site_raw))
+        min_required_history_raw = int(np.ceil(0.33 * total_site_raw))
         # enforce at least MIN_TRAINING_SAMPLES raw points as well
         min_required_history_raw = max(min_required_history_raw, MIN_TRAINING_SAMPLES)
 
@@ -557,11 +557,11 @@ def run_validation(raw_data, processed_data, n_samples=None):
         if n_site_candidates == 0:
             continue
 
-        # Target ~30% of the *total* raw measurements for this site
+        # Target ~20% of the *total* raw measurements for this site
         total_site_raw = site_total_counts.get(site, n_site_candidates)
-        target_per_site = int(np.ceil(0.3 * total_site_raw))
+        target_per_site = int(np.ceil(0.2 * total_site_raw))
 
-        # But we can only draw from candidates that satisfy the 20% history rule.
+        # But we can only draw from candidates that satisfy the 33% history rule.
         n_site_samples = min(target_per_site, n_site_candidates)
         if n_site_samples <= 0:
             continue
