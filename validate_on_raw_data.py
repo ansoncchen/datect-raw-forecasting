@@ -96,11 +96,10 @@ N_JOBS = -1  # Use all cores
 
 # Calibration/tuning
 CALIBRATION_FRACTION = 0.3  # Per-anchor fraction of historical rows for tuning/calibration
+MAX_CALIBRATION_ROWS = 20   # Hard cap on calibration rows to keep tuning tractable
 PARAM_GRID = [
     {"max_depth": 4, "n_estimators": 500, "learning_rate": 0.05, "min_child_weight": 5},
-    {"max_depth": 5, "n_estimators": 600, "learning_rate": 0.03, "min_child_weight": 5},
     {"max_depth": 6, "n_estimators": 400, "learning_rate": 0.05, "min_child_weight": 3},
-    {"max_depth": 3, "n_estimators": 800, "learning_rate": 0.03, "min_child_weight": 10},
 ]
 
 # =============================================================================
@@ -261,7 +260,7 @@ def create_transformer(df, drop_cols):
 # VALIDATION LOGIC - MATCHING ORIGINAL PIPELINE
 # =============================================================================
 
-def run_single_raw_validation(raw_measurement, feature_frame, model_params):
+def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip_quantiles=False):
     """
     Validate a single raw measurement using the EXACT approach from forecast_engine.py.
     
@@ -274,6 +273,7 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params):
         raw_measurement: dict with 'date', 'site', 'da_raw'
         processed_data: Full processed DataFrame
         model_params: XGBoost parameters
+        skip_quantiles: If True, skip quantile interval models (for tuning/calibration speed)
         
     Returns:
         dict with prediction results or None if insufficient data
@@ -356,7 +356,7 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params):
         prediction = _postprocess_prediction(float(model.predict(X_test_processed)[0]))
 
         quantile_predictions = {}
-        if ENABLE_QUANTILE_INTERVALS:
+        if ENABLE_QUANTILE_INTERVALS and not skip_quantiles:
             try:
                 for q in (0.1, 0.5, 0.9):
                     quantile_params = {
@@ -411,12 +411,13 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
 
     calib_candidates = train_data[['date', 'site', 'da_raw']].dropna().copy()
     if calib_candidates.empty:
-        return run_single_raw_validation(raw_measurement, feature_frame, base_params)
+        return run_single_raw_validation(raw_measurement, feature_frame, base_params, skip_quantiles=False)
 
     rng_seed = RANDOM_SEED + int(test_date.value % 1_000_000)
     rng = np.random.RandomState(rng_seed)
     n_candidates = len(calib_candidates)
     target_n = max(1, int(np.ceil(CALIBRATION_FRACTION * n_candidates)))
+    target_n = min(target_n, MAX_CALIBRATION_ROWS)  # Hard cap for speed
     if target_n < n_candidates:
         indices = rng.choice(n_candidates, size=target_n, replace=False)
         calib_candidates = calib_candidates.iloc[indices]
@@ -427,7 +428,7 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
     ]
 
     if len(calib_rows) < 2:
-        return run_single_raw_validation(raw_measurement, feature_frame, base_params)
+        return run_single_raw_validation(raw_measurement, feature_frame, base_params, skip_quantiles=False)
 
     best_params, _ = tune_xgb_params(calib_rows, feature_frame, base_params)
     result = run_single_raw_validation(raw_measurement, feature_frame, best_params)
@@ -435,8 +436,9 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
         return None
 
     # Run sequentially to avoid nested parallelization
+    # skip_quantiles=True: quantile models aren't needed for calibration
     calib_results = [
-        run_single_raw_validation(row, feature_frame, best_params)
+        run_single_raw_validation(row, feature_frame, best_params, skip_quantiles=True)
         for row in calib_rows
     ]
     calib_results = [r for r in calib_results if r is not None]
@@ -466,8 +468,9 @@ def tune_xgb_params(calib_rows, feature_frame, base_params):
     for override in PARAM_GRID:
         params = {**base_params, **override}
         # Run sequentially to avoid nested parallelization
+        # skip_quantiles=True: quantile models aren't needed for tuning (only R² matters)
         results = [
-            run_single_raw_validation(row, feature_frame, params)
+            run_single_raw_validation(row, feature_frame, params, skip_quantiles=True)
             for row in calib_rows
         ]
         results = [r for r in results if r is not None]
