@@ -95,7 +95,7 @@ ENABLE_PARALLEL = True
 N_JOBS = -1  # Use all cores
 
 # Calibration/tuning
-CALIBRATION_FRACTION = 0.7  # 50% for tuning, 50% for evaluation
+CALIBRATION_FRACTION = 0.7  # Per-anchor fraction of historical rows for tuning/calibration
 PARAM_GRID = [
     {"max_depth": 4, "n_estimators": 500, "learning_rate": 0.05, "min_child_weight": 5},
     {"max_depth": 5, "n_estimators": 600, "learning_rate": 0.03, "min_child_weight": 5},
@@ -393,6 +393,65 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params):
         return None
 
 
+def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_params):
+    """
+    Per-anchor validation:
+    - Sample historical anchors before the test date for tuning/calibration
+    - Tune hyperparameters on those historical anchors
+    - Calibrate output on those historical anchors
+    - Predict the current test date with the tuned params
+    """
+    test_date = raw_measurement['date']
+    site = raw_measurement['site']
+    anchor_date = test_date - pd.Timedelta(days=FORECAST_HORIZON_DAYS)
+
+    train_data = get_site_training_frame(feature_frame, site, anchor_date, MIN_TRAINING_SAMPLES)
+    if train_data is None or train_data.empty:
+        return None
+
+    calib_candidates = train_data[['date', 'site', 'da_raw']].dropna().copy()
+    if calib_candidates.empty:
+        return run_single_raw_validation(raw_measurement, feature_frame, base_params)
+
+    rng_seed = RANDOM_SEED + int(test_date.value % 1_000_000)
+    rng = np.random.RandomState(rng_seed)
+    n_candidates = len(calib_candidates)
+    target_n = max(1, int(np.ceil(CALIBRATION_FRACTION * n_candidates)))
+    if target_n < n_candidates:
+        indices = rng.choice(n_candidates, size=target_n, replace=False)
+        calib_candidates = calib_candidates.iloc[indices]
+
+    calib_rows = [
+        {'date': row['date'], 'site': row['site'], 'da_raw': row['da_raw']}
+        for _, row in calib_candidates.iterrows()
+    ]
+
+    if len(calib_rows) < 2:
+        return run_single_raw_validation(raw_measurement, feature_frame, base_params)
+
+    best_params, _ = tune_xgb_params(calib_rows, feature_frame, base_params)
+    result = run_single_raw_validation(raw_measurement, feature_frame, best_params)
+    if result is None:
+        return None
+
+    calib_results = Parallel(n_jobs=N_JOBS)(
+        delayed(run_single_raw_validation)(row, feature_frame, best_params)
+        for row in calib_rows
+    )
+    calib_results = [r for r in calib_results if r is not None]
+    if len(calib_results) < 2:
+        return result
+
+    calib_df = pd.DataFrame(calib_results)
+    slope, intercept = calibrate_linear(
+        calib_df["actual_da_raw"].values,
+        calib_df["predicted_da"].values,
+    )
+    result["predicted_da"] = slope * result["predicted_da"] + intercept
+    result["predicted_da"] = max(0.0, result["predicted_da"])
+    return result
+
+
 def calibrate_linear(y_true, y_pred):
     if len(y_true) < 3:
         return 1.0, 0.0
@@ -547,69 +606,29 @@ def run_validation(raw_data, processed_data, n_samples=None):
         {'date': row['date'], 'site': row['site'], 'da_raw': row['da_raw']}
         for _, row in test_samples.iterrows()
     ]
-
-    # Split for calibration/tuning: temporal split with random cutoff (no future leakage)
-    # Calib = earlier dates, Eval = later dates; cutoff percentile randomized for variety
-    rng = np.random.RandomState(RANDOM_SEED)
-    sorted_rows = sorted(sample_rows, key=lambda r: r["date"])
-    pct_low = max(0.05, CALIBRATION_FRACTION - 0.05)
-    pct_high = min(0.95, CALIBRATION_FRACTION + 0.05)
-    split_pct = float(rng.uniform(pct_low, pct_high))
-    cutoff_idx = max(1, min(int(len(sorted_rows) * split_pct), len(sorted_rows) - 1))
-    cutoff_date = sorted_rows[cutoff_idx - 1]["date"]
-    calib_rows = [r for r in sorted_rows if r["date"] <= cutoff_date]
-    eval_rows = [r for r in sorted_rows if r["date"] > cutoff_date]
-    # Fallback if all dates identical (would make eval empty)
-    if not calib_rows or not eval_rows:
-        indices = np.arange(len(sample_rows))
-        rng.shuffle(indices)
-        split_idx = max(1, min(int(len(indices) * CALIBRATION_FRACTION), len(indices) - 1))
-        calib_rows = [sample_rows[i] for i in indices[:split_idx]]
-        eval_rows = [sample_rows[i] for i in indices[split_idx:]]
-        print(f"\nData split (random fallback; temporal split yielded empty set):")
-    else:
-        print(f"\nData split (temporal, CALIBRATION_FRACTION target={CALIBRATION_FRACTION}):")
-        print(f"  Cutoff date: {cutoff_date.date()} (percentile ~{100*split_pct:.0f}%)")
-    print(f"  Calibration set (earlier dates, for hyperparameter tuning): {len(calib_rows)} samples")
-    print(f"  Evaluation set (later dates, for final metrics):             {len(eval_rows)} samples")
-
-    best_params, best_r2 = tune_xgb_params(calib_rows, feature_frame, base_params)
-    print(f"\nBest XGBoost params (calib R²={best_r2:.3f}): {best_params}")
+    print(
+        f"\nPer-anchor tuning/calibration: sampling {CALIBRATION_FRACTION:.0%} "
+        f"of pre-anchor history for each test date"
+    )
 
     if ENABLE_PARALLEL:
         results = Parallel(n_jobs=N_JOBS)(
-            delayed(run_single_raw_validation)(row, feature_frame, best_params)
-            for row in eval_rows
+            delayed(run_single_raw_validation_with_tuning)(row, feature_frame, base_params)
+            for row in sample_rows
         )
     else:
         results = [
-            run_single_raw_validation(row, feature_frame, best_params)
-            for row in tqdm(eval_rows, desc="Validating")
+            run_single_raw_validation_with_tuning(row, feature_frame, base_params)
+            for row in tqdm(sample_rows, desc="Validating")
         ]
 
     results = [r for r in results if r is not None]
-
-    print(f"\nEvaluation set results: {len(results)} / {len(eval_rows)} successful predictions ({100*len(results)/len(eval_rows):.1f}%)")
+    print(
+        f"\nEvaluation results: {len(results)} / {len(sample_rows)} successful predictions "
+        f"({100*len(results)/len(sample_rows):.1f}%)"
+    )
 
     results_df = pd.DataFrame(results)
-    if results_df.empty:
-        return results_df
-
-    # Calibrate on calibration subset predictions from best params
-    calib_results = Parallel(n_jobs=N_JOBS)(
-        delayed(run_single_raw_validation)(row, feature_frame, best_params)
-        for row in calib_rows
-    )
-    calib_results = [r for r in calib_results if r is not None]
-    if calib_results:
-        calib_df = pd.DataFrame(calib_results)
-        slope, intercept = calibrate_linear(
-            calib_df["actual_da_raw"].values,
-            calib_df["predicted_da"].values,
-        )
-        results_df["predicted_da"] = slope * results_df["predicted_da"] + intercept
-        results_df["predicted_da"] = results_df["predicted_da"].clip(lower=0.0)
-
     return results_df
 
 
@@ -1224,7 +1243,7 @@ def save_results(results_df, metrics, output_dir):
         f.write(f"  Use log target: {USE_LOG_TARGET}\n")
         f.write(f"  Prediction clip quantile: {PREDICTION_CLIP_Q}\n")
         f.write(f"  Parallel enabled: {ENABLE_PARALLEL} (n_jobs={N_JOBS})\n")
-        f.write(f"  Calibration fraction: {CALIBRATION_FRACTION}\n")
+        f.write(f"  Per-anchor calibration fraction: {CALIBRATION_FRACTION}\n")
         if "ensemble_weight_naive" in results_df.columns:
             f.write(f"  Ensemble weight (naive): {results_df['ensemble_weight_naive'].iloc[0]:.2f}\n")
         f.write("\n")
@@ -1268,6 +1287,7 @@ def main():
     print(f"  - Min test date: {MIN_TEST_DATE}")
     print(f"  - Spike threshold: {SPIKE_THRESHOLD} μg/g")
     print(f"  - Random seed: {RANDOM_SEED}")
+    print(f"  - Per-anchor calibration fraction: {CALIBRATION_FRACTION}")
     print(f"  - Plots output: {PLOTS_OUTPUT_DIR}")
     
     # Load data
