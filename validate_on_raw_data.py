@@ -612,16 +612,18 @@ def run_validation(raw_data, processed_data, n_samples=None):
         f"\nPer-anchor tuning/calibration: sampling {CALIBRATION_FRACTION:.0%} "
         f"of pre-anchor history for each test date"
     )
+    print(f"\nValidating {len(sample_rows)} samples...")
+    pbar = tqdm(sample_rows, desc="Validating", unit="sample")
 
     if ENABLE_PARALLEL:
         results = Parallel(n_jobs=N_JOBS)(
             delayed(run_single_raw_validation_with_tuning)(row, feature_frame, base_params)
-            for row in sample_rows
+            for row in pbar
         )
     else:
         results = [
             run_single_raw_validation_with_tuning(row, feature_frame, base_params)
-            for row in tqdm(sample_rows, desc="Validating")
+            for row in pbar
         ]
 
     results = [r for r in results if r is not None]
