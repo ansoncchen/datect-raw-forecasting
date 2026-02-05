@@ -434,10 +434,11 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
     if result is None:
         return None
 
-    calib_results = Parallel(n_jobs=N_JOBS)(
-        delayed(run_single_raw_validation)(row, feature_frame, best_params)
+    # Run sequentially to avoid nested parallelization
+    calib_results = [
+        run_single_raw_validation(row, feature_frame, best_params)
         for row in calib_rows
-    )
+    ]
     calib_results = [r for r in calib_results if r is not None]
     if len(calib_results) < 2:
         return result
@@ -464,10 +465,11 @@ def tune_xgb_params(calib_rows, feature_frame, base_params):
     best_r2 = float("-inf")
     for override in PARAM_GRID:
         params = {**base_params, **override}
-        results = Parallel(n_jobs=N_JOBS)(
-            delayed(run_single_raw_validation)(row, feature_frame, params)
+        # Run sequentially to avoid nested parallelization
+        results = [
+            run_single_raw_validation(row, feature_frame, params)
             for row in calib_rows
-        )
+        ]
         results = [r for r in results if r is not None]
         if not results:
             continue
