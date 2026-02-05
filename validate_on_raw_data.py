@@ -44,7 +44,6 @@ from forecasting.raw_data_forecaster import (
     get_last_known_raw_da,
     get_site_test_row,
     get_site_training_frame,
-    fit_tft_on_raw,
     recompute_test_row_persistence_features,
 )
 from forecasting.sample_weights import compute_spike_focused_weights
@@ -83,9 +82,6 @@ RANDOM_SEED = 42
 
 # Output directory for plots
 PLOTS_OUTPUT_DIR = "./raw_validation_plots"
-
-# Optional TFT usage (can be slow)
-ENABLE_TFT = False
 
 # Optional quantile prediction intervals (extra models per sample)
 ENABLE_QUANTILE_INTERVALS = True
@@ -435,29 +431,6 @@ def run_validation(raw_data, processed_data, n_samples=None):
     # Prepare raw/feature frames
     raw_weekly = aggregate_raw_to_weekly(raw_data)
     feature_frame = build_raw_feature_frame(processed_data, raw_weekly)
-
-    if ENABLE_TFT:
-        try:
-            print("\nAttempting TFT training (this can be slow)...")
-            tft_model, tft_dataset = fit_tft_on_raw(feature_frame)
-            tft_pred = tft_model.model.predict(tft_dataset, mode="prediction", return_x=True)
-            if isinstance(tft_pred, tuple):
-                tft_values, tft_x = tft_pred
-                tft_actual = tft_x.get("decoder_target")
-            else:
-                tft_values = tft_pred
-                tft_actual = None
-
-            tft_values = tft_values.detach().cpu().numpy().reshape(-1)
-            if tft_actual is not None:
-                tft_actual = tft_actual.detach().cpu().numpy().reshape(-1)
-                tft_r2 = r2_score(tft_actual, tft_values)
-                tft_mae = mean_absolute_error(tft_actual, tft_values)
-                print(f"TFT baseline (all windows) R²={tft_r2:.3f}, MAE={tft_mae:.3f}")
-            else:
-                print("Warning: TFT predictions returned without targets for comparison.")
-        except Exception as e:
-            print(f"Warning: TFT training/evaluation failed: {e}")
 
     # Filter to valid test dates (very early lower bound)
     min_test_date = pd.Timestamp(MIN_TEST_DATE)

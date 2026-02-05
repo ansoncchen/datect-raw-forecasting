@@ -258,11 +258,11 @@ datect-raw-forecasting/
 │   ├── __init__.py
 │   ├── data_processor.py        # Lag feature creation
 │   ├── raw_data_forecaster.py   # Core forecasting utilities
-│   ├── torch_forecasting_adapter.py  # TFT dataset utilities
 │   ├── logging_config.py
+│   ├── model_factory.py         # XGBoost model builder
+│   ├── sample_weights.py        # Spike-focused sample weighting
 │   └── models/
-│       ├── __init__.py
-│       └── tft_model.py         # Optional TFT model wrapper
+│       └── __init__.py          # Device/accelerator utilities
 ├── data/
 │   ├── README.md
 │   ├── raw/da-input/*.csv       # Raw DA measurements
@@ -286,13 +286,6 @@ In `config.py`:
 ```python
 FORECAST_HORIZON_WEEKS = 2  # Change from 1 to 2 weeks
 FORECAST_HORIZON_DAYS = FORECAST_HORIZON_WEEKS * 7
-```
-
-### Using TFT Instead of XGBoost
-
-Set in `validate_on_raw_data.py`:
-```python
-ENABLE_TFT = True  # Warning: slow, requires pytorch-forecasting
 ```
 
 ---

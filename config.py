@@ -186,7 +186,7 @@ FORECAST_HORIZON_WEEKS = 1
 FORECAST_HORIZON_DAYS = FORECAST_HORIZON_WEEKS * 7  # Derived days value for internal calculations
 
 # GPU Configuration
-# Controls GPU usage for XGBoost, TFT, TCN, GPyTorch, and TabNet models.
+# Controls GPU usage for XGBoost.
 # 
 # IMPORTANT: For precompute_cache.py and other joblib-parallelized workloads,
 # set USE_GPU = False. GPU mode with parallel workers causes memory contention

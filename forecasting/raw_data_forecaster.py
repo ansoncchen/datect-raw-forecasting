@@ -17,8 +17,6 @@ import numpy as np
 
 import config
 from .data_processor import DataProcessor
-from .torch_forecasting_adapter import build_timeseries_dataset
-from .models.tft_model import TFTRegressor
 from .logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -246,43 +244,3 @@ def get_last_known_raw_da(
     if train_data is None or train_data.empty:
         return None
     return float(train_data["da_raw"].iloc[-1])
-
-
-def build_tft_dataset_for_raw(
-    feature_frame: pd.DataFrame,
-    max_encoder_length: int = 26,
-    max_prediction_length: int = 1,
-):
-    """
-    Build a TimeSeriesDataSet for TFT training using raw DA measurements.
-    """
-    if "da_raw" not in feature_frame.columns:
-        raise ValueError("da_raw column is required for TFT dataset.")
-    dataset, _, _ = build_timeseries_dataset(
-        feature_frame,
-        target_col="da_raw",
-        group_col="site",
-        time_col="date",
-        max_encoder_length=max_encoder_length,
-        max_prediction_length=max_prediction_length,
-    )
-    return dataset
-
-
-def fit_tft_on_raw(
-    feature_frame: pd.DataFrame,
-    max_encoder_length: int = 26,
-    max_prediction_length: int = 1,
-    tft_params: Optional[dict] = None,
-):
-    """
-    Fit a TFT model on raw DA data using the adapter utilities.
-    """
-    dataset = build_tft_dataset_for_raw(
-        feature_frame,
-        max_encoder_length=max_encoder_length,
-        max_prediction_length=max_prediction_length,
-    )
-    model = TFTRegressor(**(tft_params or {}))
-    model.fit(dataset)
-    return model, dataset
