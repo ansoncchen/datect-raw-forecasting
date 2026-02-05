@@ -7,6 +7,9 @@ MAX_CALLS_PER_HOUR=100
 CLAUDE_TIMEOUT_MINUTES=30
 CLAUDE_OUTPUT_FORMAT="text"
 
+# Model selection: "sonnet" (faster, cheaper) or "opus" (smarter, expensive)
+CLAUDE_MODEL="sonnet"
+
 ALLOWED_TOOLS="Write,Read,Edit,Bash(git *),Bash(python3 *),Bash(pip *),Bash(pip3 *),Bash(pytest *),Bash(ls *),Bash(cd *),Bash(cat *),Bash(head *),Bash(tail *)"
 
 SESSION_CONTINUITY=true
