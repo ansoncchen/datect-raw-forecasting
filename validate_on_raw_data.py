@@ -579,7 +579,7 @@ def run_validation(raw_data, processed_data, n_samples=None):
     test_samples = pd.concat(sampled_rows, ignore_index=True)
     n_samples = len(test_samples)
 
-    print("\nPer-site test sample counts (~30% of total raw measurements, subject to history constraints):")
+    print("\nPer-site test sample counts (~20% of total raw measurements, subject to history constraints):")
     for site, count in sorted(per_site_counts.items()):
         print(f"  {site}: {count}")
 
@@ -1237,7 +1237,7 @@ def save_results(results_df, metrics, output_dir):
         
         f.write("CONFIGURATION\n")
         f.write(f"  Forecast horizon: {FORECAST_HORIZON_DAYS} days\n")
-        f.write("  Test sampling: ~30% per site with 20% history requirement\n")
+        f.write("  Test sampling: ~20% per site with 33% history requirement\n")
         f.write(f"  Min training samples: {MIN_TRAINING_SAMPLES}\n")
         f.write(f"  Min test date: {MIN_TEST_DATE}\n")
         f.write(f"  Spike threshold: {SPIKE_THRESHOLD} μg/g\n")
@@ -1284,7 +1284,7 @@ def main():
     print(f"")
     print(f"Configuration:")
     print(f"  - Forecast horizon: {FORECAST_HORIZON_DAYS} days")
-    print(f"  - Test sampling: ~30% of each site's raw measurements (with 20% history requirement)")
+    print(f"  - Test sampling: ~20% of each site's raw measurements (with 33% history requirement)")
     print(f"  - Min training samples: {MIN_TRAINING_SAMPLES}")
     print(f"  - Min test date: {MIN_TEST_DATE}")
     print(f"  - Spike threshold: {SPIKE_THRESHOLD} μg/g")
