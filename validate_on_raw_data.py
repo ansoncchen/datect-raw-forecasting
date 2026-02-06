@@ -113,7 +113,7 @@ PARAM_GRID = [
 USE_TWO_STAGE_MODEL = False  # DISABLED - tested both architectures, single-stage performs better (R²=0.224 vs 0.100)
 
 # Per-site model configurations (Phase 9)
-USE_PER_SITE_MODELS = True  # Enable site-specific XGB params, features, ensemble weights
+USE_PER_SITE_MODELS = False  # Enable site-specific XGB params, features, ensemble weights
 
 # =============================================================================
 # RAW DATA LOADING
