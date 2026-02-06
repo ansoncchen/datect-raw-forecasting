@@ -103,7 +103,7 @@ PARAM_GRID = [
 ]
 
 # Two-stage model (classifier → regressor)
-USE_TWO_STAGE_MODEL = True  # Enable two-stage architecture for better spike detection
+USE_TWO_STAGE_MODEL = False  # DISABLED - tested both architectures, single-stage performs better (R²=0.224 vs 0.100)
 
 # =============================================================================
 # RAW DATA LOADING
