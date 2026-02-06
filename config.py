@@ -273,7 +273,7 @@ BOOTSTRAP_SUBSAMPLE_FRACTION = 0.75  # Use 75% of data for each bootstrap iterat
 # Scientific Methodology Configuration
 
 # Sample weighting strategy for regression models
-USE_REGRESSION_SAMPLE_WEIGHTS = True  # False = fair baseline comparison, True = handle imbalance
+USE_REGRESSION_SAMPLE_WEIGHTS = False  # Disabled - sample weights cause over-prediction
 
 # Confidence interval percentiles for bootstrap predictions
 CONFIDENCE_PERCENTILES = [5, 50, 95]  # 5th percentile, median, 95th percentile
