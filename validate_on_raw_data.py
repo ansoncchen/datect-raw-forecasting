@@ -351,19 +351,20 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
             # Two-stage architecture: Classifier → Regressor
             from forecasting.two_stage_model import train_two_stage_model, predict_two_stage
 
-            classifier, reg_spike, reg_normal = train_two_stage_model(
+            classifier, regressor = train_two_stage_model(
                 X_train_processed, y_train_raw,
+                model_params=model_params,
                 spike_threshold=SPIKE_THRESHOLD,
                 sample_weight=sample_weight
             )
 
             raw_prediction, spike_probability = predict_two_stage(
-                classifier, reg_spike, reg_normal, X_test_processed,
+                classifier, regressor, X_test_processed,
                 spike_threshold=SPIKE_THRESHOLD
             )
 
-            # Use the normal regressor as 'model' for quantile predictions
-            model = reg_normal
+            # Use the regressor for quantile predictions and feature importance
+            model = regressor
         else:
             # Single-stage XGBoost regressor
             model = build_xgb_regressor(model_params)

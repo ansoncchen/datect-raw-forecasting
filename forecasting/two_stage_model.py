@@ -17,22 +17,27 @@ from typing import Tuple, Optional
 def train_two_stage_model(
     X_train: np.ndarray,
     y_train: np.ndarray,
+    model_params: dict,
     spike_threshold: float = 20.0,
     sample_weight: Optional[np.ndarray] = None
-) -> Tuple[xgb.XGBClassifier, Optional[xgb.XGBRegressor], xgb.XGBRegressor]:
+) -> Tuple[xgb.XGBClassifier, xgb.XGBRegressor]:
     """
     Train two-stage model:
-    Stage 1: Binary classifier (spike vs non-spike)
-    Stage 2: Separate regressors for spike and non-spike cases
+    Stage 1: Binary classifier (spike vs non-spike) with probability threshold
+    Stage 2: Single regressor for magnitude, with spike-aware prediction adjustment
+
+    This simpler architecture avoids data fragmentation while maintaining
+    spike detection focus.
 
     Args:
         X_train: Training features
         y_train: Training targets (raw DA values)
+        model_params: Base XGBoost parameters to use
         spike_threshold: Threshold for spike classification (μg/g)
         sample_weight: Optional sample weights (ignored to avoid over-prediction)
 
     Returns:
-        Tuple of (classifier, spike_regressor, normal_regressor)
+        Tuple of (classifier, regressor)
     """
     # Stage 1: Binary spike classifier
     y_binary = (y_train > spike_threshold).astype(int)
@@ -42,65 +47,47 @@ def train_two_stage_model(
     n_pos = np.sum(y_binary == 1)
     scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
 
+    # Use model_params but override for classification
     clf_params = {
-        'n_estimators': 300,
-        'max_depth': 4,
-        'learning_rate': 0.05,
+        **model_params,
         'scale_pos_weight': scale_pos_weight,
-        'tree_method': 'hist',
-        'random_state': 42
+        'objective': 'binary:logistic',  # Binary classification
     }
+    # Remove regression-specific params
+    clf_params.pop('reg_alpha', None)
+    clf_params.pop('reg_lambda', None)
 
     classifier = xgb.XGBClassifier(**clf_params)
-    # Don't use sample_weight - causes over-prediction
     classifier.fit(X_train, y_binary)
 
-    # Stage 2: Train separate regressors
-    spike_mask = y_train > spike_threshold
+    # Stage 2: Single regressor on all data (maintains data volume)
+    reg_params = {**model_params}
+    regressor = xgb.XGBRegressor(**reg_params)
+    regressor.fit(X_train, y_train)
 
-    # Spike regressor (high-DA events)
-    reg_spike = None
-    if np.sum(spike_mask) >= 10:  # Need minimum samples
-        reg_spike_params = {
-            'n_estimators': 400,
-            'max_depth': 6,  # Deeper tree for complex spike patterns
-            'learning_rate': 0.05,
-            'tree_method': 'hist',
-            'random_state': 42
-        }
-        reg_spike = xgb.XGBRegressor(**reg_spike_params)
-        # Don't use sample_weight - causes over-prediction
-        reg_spike.fit(X_train[spike_mask], y_train[spike_mask])
-
-    # Normal regressor (low-DA events)
-    reg_normal_params = {
-        'n_estimators': 300,
-        'max_depth': 4,
-        'learning_rate': 0.05,
-        'tree_method': 'hist',
-        'random_state': 42
-    }
-    reg_normal = xgb.XGBRegressor(**reg_normal_params)
-    # Don't use sample_weight - causes over-prediction
-    reg_normal.fit(X_train[~spike_mask], y_train[~spike_mask])
-
-    return classifier, reg_spike, reg_normal
+    return classifier, regressor
 
 
 def predict_two_stage(
     classifier: xgb.XGBClassifier,
-    reg_spike: Optional[xgb.XGBRegressor],
-    reg_normal: xgb.XGBRegressor,
+    regressor: xgb.XGBRegressor,
     X_test: np.ndarray,
     spike_threshold: float = 20.0
 ) -> Tuple[float, float]:
     """
     Make prediction using two-stage model
 
+    Strategy:
+    1. Classifier determines spike probability
+    2. Regressor predicts magnitude
+    3. If high spike probability (>0.5), ensure prediction is at least at threshold
+
+    This prevents the classifier from detecting a spike while the regressor
+    predicts a low value.
+
     Args:
         classifier: Trained spike classifier
-        reg_spike: Trained spike regressor (may be None)
-        reg_normal: Trained normal regressor
+        regressor: Trained regressor for magnitude
         X_test: Test features (single sample)
         spike_threshold: Threshold used for training
 
@@ -110,19 +97,19 @@ def predict_two_stage(
     # Stage 1: Predict spike probability
     spike_prob = classifier.predict_proba(X_test)[0, 1]
 
-    # Stage 2: Get predictions from both regressors
-    pred_normal = reg_normal.predict(X_test)[0]
+    # Stage 2: Get magnitude prediction
+    base_pred = regressor.predict(X_test)[0]
 
-    if reg_spike is not None:
-        pred_spike = reg_spike.predict(X_test)[0]
+    # Adjustment: If classifier says spike (prob > 0.5) but regressor predicts low,
+    # blend toward threshold to maintain consistency
+    if spike_prob > 0.5 and base_pred < spike_threshold:
+        # Blend between base prediction and threshold based on confidence
+        # spike_prob = 0.5 → no adjustment
+        # spike_prob = 1.0 → push halfway to threshold
+        adjustment_factor = (spike_prob - 0.5) * 2  # 0 to 1
+        final_pred = base_pred + adjustment_factor * (spike_threshold - base_pred) * 0.5
     else:
-        # Fallback if no spike training data
-        # Use a conservative high value above threshold
-        pred_spike = spike_threshold * 1.5
-
-    # Blend based on spike probability
-    # Higher spike_prob → weight more toward spike regressor
-    final_pred = spike_prob * pred_spike + (1 - spike_prob) * pred_normal
+        final_pred = base_pred
 
     # Ensure non-negative
     final_pred = max(0.0, final_pred)
