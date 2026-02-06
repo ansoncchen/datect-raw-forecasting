@@ -220,58 +220,39 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
     # ==================================================================
 
     'Copalis': {
-        # R²=0.72, N=167. Already excellent.
-        'xgb_params': {
-            'max_depth': 5,
-            'n_estimators': 400,
-            'learning_rate': 0.05,
-            'min_child_weight': 3,
-        },
+        # R²=0.72, N=167. Already excellent -- true pass-through, no intervention.
+        'xgb_params': None,
         'param_grid': None,
         'feature_subset': None,
-        'ensemble_weights': (0.70, 0.30),
+        'ensemble_weights': None,
         'prediction_clip_q': None,
         'prediction_clip_max': None,
     },
 
     'Kalaloch': {
-        # R²=0.67, N=131. Already excellent.
-        'xgb_params': {
-            'max_depth': 5,
-            'n_estimators': 400,
-            'learning_rate': 0.05,
-            'min_child_weight': 3,
-        },
+        # R²=0.67, N=131. Already excellent -- true pass-through, no intervention.
+        'xgb_params': None,
         'param_grid': None,
         'feature_subset': None,
-        'ensemble_weights': (0.70, 0.30),
+        'ensemble_weights': None,
         'prediction_clip_q': None,
         'prediction_clip_max': None,
     },
 
     'Quinault': {
-        # R²=0.64, N=113. Good performance.
-        'xgb_params': {
-            'max_depth': 5,
-            'n_estimators': 400,
-            'learning_rate': 0.05,
-            'min_child_weight': 3,
-        },
+        # R²=0.64, N=113. Good performance -- true pass-through, no intervention.
+        'xgb_params': None,
         'param_grid': None,
         'feature_subset': None,
-        'ensemble_weights': (0.70, 0.30),
+        'ensemble_weights': None,
         'prediction_clip_q': None,
         'prediction_clip_max': None,
     },
 
     'Twin Harbors': {
         # R²=0.62, N=138. Good but naive is better (R²=0.76).
-        'xgb_params': {
-            'max_depth': 4,
-            'n_estimators': 350,
-            'learning_rate': 0.05,
-            'min_child_weight': 5,
-        },
+        # Only change: ensemble weight favors naive more. No XGB param overrides.
+        'xgb_params': None,
         'param_grid': None,
         'feature_subset': None,
         'ensemble_weights': (0.50, 0.50),
