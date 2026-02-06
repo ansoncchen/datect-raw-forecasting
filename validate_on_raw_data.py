@@ -310,8 +310,10 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
     train_data = add_temporal_features(train_data)
     test_row = add_temporal_features(test_row)
     
-    # Prepare features - Drop both raw and processed targets
-    drop_cols = ['date', 'site', 'da_raw', 'da']
+    # Prepare features - Drop both raw and processed targets + zero-importance features
+    drop_cols = ['date', 'site', 'da_raw', 'da',
+                  # Zero/near-zero importance features from analysis:
+                  'lat', 'lon', 'weeks_since_last_raw', 'is_bloom_season', 'quarter', 'da_raw_lag_52']
     
     try:
         # Create transformer and fit on training data only
