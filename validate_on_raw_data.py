@@ -339,9 +339,28 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
         X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
         X_test_processed = transformer.transform(X_test)
         
-        # Train XGBoost on raw targets
+        # Train XGBoost on raw targets with early stopping
         model = build_xgb_regressor(model_params)
-        model.fit(X_train_processed, y_train, sample_weight=sample_weight)
+
+        # Split training data: 80% train, 20% validation for early stopping
+        if len(X_train_processed) > 10:
+            val_split = int(0.8 * len(X_train_processed))
+            X_es_train = X_train_processed[:val_split]
+            X_es_val = X_train_processed[val_split:]
+            y_es_train = y_train[:val_split]
+            y_es_val = y_train[val_split:]
+            w_es_train = sample_weight[:val_split] if sample_weight is not None else None
+
+            model.fit(
+                X_es_train, y_es_train,
+                sample_weight=w_es_train,
+                eval_set=[(X_es_val, y_es_val)],
+                early_stopping_rounds=50,
+                verbose=False
+            )
+        else:
+            # Too few samples for early stopping split
+            model.fit(X_train_processed, y_train, sample_weight=sample_weight)
         
         # Predict using TEST DATE features
         def _postprocess_prediction(value: float) -> float:
@@ -618,8 +637,9 @@ def run_validation(raw_data, processed_data, n_samples=None):
     results_df = pd.DataFrame(results)
 
     # Add ensemble prediction: weighted average of XGBoost and Naive
-    ENSEMBLE_WEIGHT_XGB = 0.6
-    ENSEMBLE_WEIGHT_NAIVE = 0.4
+    # Favor naive more to improve MAE while keeping XGB's high recall
+    ENSEMBLE_WEIGHT_XGB = 0.35
+    ENSEMBLE_WEIGHT_NAIVE = 0.65
     results_df['ensemble_prediction'] = (
         ENSEMBLE_WEIGHT_XGB * results_df['predicted_da'] +
         ENSEMBLE_WEIGHT_NAIVE * results_df['naive_prediction']
@@ -720,7 +740,7 @@ def calculate_metrics(results_df):
 
     if ensemble is not None:
         print(f"\n{'='*60}")
-        print("ENSEMBLE PERFORMANCE (0.6*XGB + 0.4*Naive)")
+        print("ENSEMBLE PERFORMANCE (0.35*XGB + 0.65*Naive)")
         print(f"{'='*60}")
         print(f"  R² Score:              {ensemble_r2:.4f}")
         print(f"  MAE:                   {ensemble_mae:.4f} μg/g")
