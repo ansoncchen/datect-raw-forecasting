@@ -47,6 +47,13 @@ from forecasting.raw_data_forecaster import (
     recompute_test_row_persistence_features,
 )
 from forecasting.sample_weights import compute_spike_focused_weights
+from forecasting.per_site_models import (
+    apply_site_xgb_params,
+    get_site_param_grid,
+    get_site_ensemble_weights,
+    get_site_clip_params,
+    compute_site_drop_cols,
+)
 
 # Try to import plotly for visualizations
 try:
@@ -104,6 +111,9 @@ PARAM_GRID = [
 
 # Two-stage model (classifier → regressor)
 USE_TWO_STAGE_MODEL = False  # DISABLED - tested both architectures, single-stage performs better (R²=0.224 vs 0.100)
+
+# Per-site model configurations (Phase 9)
+USE_PER_SITE_MODELS = True  # Enable site-specific XGB params, features, ensemble weights
 
 # =============================================================================
 # RAW DATA LOADING
@@ -317,7 +327,11 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
     drop_cols = ['date', 'site', 'da_raw', 'da',
                   # Zero/near-zero importance features from analysis:
                   'lat', 'lon', 'weeks_since_last_raw', 'is_bloom_season', 'quarter', 'da_raw_lag_52']
-    
+
+    # Per-site feature subsetting: extend drop_cols to keep only site-relevant features
+    if USE_PER_SITE_MODELS:
+        drop_cols = compute_site_drop_cols(drop_cols, train_data.columns.tolist(), site)
+
     try:
         # Create transformer and fit on training data only
         transformer, X_train = create_transformer(train_data, drop_cols)
@@ -399,9 +413,22 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
             if USE_LOG_TARGET and not USE_TWO_STAGE_MODEL:
                 value = np.expm1(value)
             value = max(0.0, value)
-            if PREDICTION_CLIP_Q is not None:
-                clip_max = float(np.quantile(train_data['da_raw'], PREDICTION_CLIP_Q))
+
+            # Determine clip quantile and hard max (per-site or global)
+            if USE_PER_SITE_MODELS:
+                site_clip_q, site_clip_max = get_site_clip_params(site)
+                clip_q = site_clip_q if site_clip_q is not None else PREDICTION_CLIP_Q
+            else:
+                clip_q = PREDICTION_CLIP_Q
+                site_clip_max = None
+
+            if clip_q is not None:
+                clip_max = float(np.quantile(train_data['da_raw'], clip_q))
                 value = min(value, clip_max)
+
+            if site_clip_max is not None:
+                value = min(value, site_clip_max)
+
             return float(value)
 
         prediction = _postprocess_prediction(raw_prediction)
@@ -472,13 +499,19 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
     site = raw_measurement['site']
     anchor_date = test_date - pd.Timedelta(days=FORECAST_HORIZON_DAYS)
 
+    # Apply site-specific XGB parameter overrides
+    if USE_PER_SITE_MODELS:
+        effective_base_params = apply_site_xgb_params(base_params, site)
+    else:
+        effective_base_params = base_params
+
     train_data = get_site_training_frame(feature_frame, site, anchor_date, MIN_TRAINING_SAMPLES)
     if train_data is None or train_data.empty:
         return None
 
     calib_candidates = train_data[['date', 'site', 'da_raw']].dropna().copy()
     if calib_candidates.empty:
-        return run_single_raw_validation(raw_measurement, feature_frame, base_params, skip_quantiles=False)
+        return run_single_raw_validation(raw_measurement, feature_frame, effective_base_params, skip_quantiles=False)
 
     rng_seed = RANDOM_SEED + int(test_date.value % 1_000_000)
     rng = np.random.RandomState(rng_seed)
@@ -495,9 +528,11 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
     ]
 
     if len(calib_rows) < 2:
-        return run_single_raw_validation(raw_measurement, feature_frame, base_params, skip_quantiles=False)
+        return run_single_raw_validation(raw_measurement, feature_frame, effective_base_params, skip_quantiles=False)
 
-    best_params, _ = tune_xgb_params(calib_rows, feature_frame, base_params)
+    # Use site-specific PARAM_GRID if available
+    site_grid = get_site_param_grid(site) if USE_PER_SITE_MODELS else None
+    best_params, _ = tune_xgb_params(calib_rows, feature_frame, effective_base_params, param_grid_override=site_grid)
     result = run_single_raw_validation(raw_measurement, feature_frame, best_params)
     return result  # No calibration - removed circular optimization
 
@@ -509,10 +544,11 @@ def calibrate_linear(y_true, y_pred):
     return float(slope), float(intercept)
 
 
-def tune_xgb_params(calib_rows, feature_frame, base_params):
+def tune_xgb_params(calib_rows, feature_frame, base_params, param_grid_override=None):
+    grid = param_grid_override if param_grid_override is not None else PARAM_GRID
     best_params = base_params
     best_r2 = float("-inf")
-    for override in PARAM_GRID:
+    for override in grid:
         params = {**base_params, **override}
         # Run sequentially to avoid nested parallelization
         # skip_quantiles=True: quantile models aren't needed for tuning (only R² matters)
@@ -686,15 +722,29 @@ def run_validation(raw_data, processed_data, n_samples=None):
 
     # Add ensemble prediction only if we have predictions
     if not results_df.empty and 'predicted_da' in results_df.columns and 'naive_prediction' in results_df.columns:
-        # Favor XGB (R²=0.22) over naive (R²=-0.14) while keeping naive's MAE benefit
-        ENSEMBLE_WEIGHT_XGB = 0.65
-        ENSEMBLE_WEIGHT_NAIVE = 0.35
-        results_df['ensemble_prediction'] = (
-            ENSEMBLE_WEIGHT_XGB * results_df['predicted_da'] +
-            ENSEMBLE_WEIGHT_NAIVE * results_df['naive_prediction']
-        )
-        results_df['ensemble_weight_xgb'] = ENSEMBLE_WEIGHT_XGB
-        results_df['ensemble_weight_naive'] = ENSEMBLE_WEIGHT_NAIVE
+        if USE_PER_SITE_MODELS:
+            # Per-site ensemble weights
+            ensemble_preds = []
+            xgb_weights = []
+            naive_weights = []
+            for _, row in results_df.iterrows():
+                w_xgb, w_naive = get_site_ensemble_weights(row['site'])
+                ensemble_preds.append(w_xgb * row['predicted_da'] + w_naive * row['naive_prediction'])
+                xgb_weights.append(w_xgb)
+                naive_weights.append(w_naive)
+            results_df['ensemble_prediction'] = ensemble_preds
+            results_df['ensemble_weight_xgb'] = xgb_weights
+            results_df['ensemble_weight_naive'] = naive_weights
+        else:
+            # Global ensemble weights
+            ENSEMBLE_WEIGHT_XGB = 0.65
+            ENSEMBLE_WEIGHT_NAIVE = 0.35
+            results_df['ensemble_prediction'] = (
+                ENSEMBLE_WEIGHT_XGB * results_df['predicted_da'] +
+                ENSEMBLE_WEIGHT_NAIVE * results_df['naive_prediction']
+            )
+            results_df['ensemble_weight_xgb'] = ENSEMBLE_WEIGHT_XGB
+            results_df['ensemble_weight_naive'] = ENSEMBLE_WEIGHT_NAIVE
 
     # Aggregate and analyze feature importance
     if not results_df.empty:
