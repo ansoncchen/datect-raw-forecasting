@@ -397,7 +397,16 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
         naive_prediction = get_last_known_raw_da(train_data)
         if naive_prediction is None:
             return None
-        
+
+        # Extract feature importance for analysis
+        feature_importance = {}
+        try:
+            if hasattr(model, 'feature_importances_'):
+                feature_names = X_train.columns.tolist()
+                feature_importance = dict(zip(feature_names, model.feature_importances_))
+        except Exception:
+            pass  # Skip if feature importance extraction fails
+
         return {
             'test_date': test_date,
             'anchor_date': anchor_date,
@@ -408,7 +417,8 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
             'naive_prediction': naive_prediction,
             'training_samples': len(train_data),
             'days_ahead': (test_date - anchor_date).days,
-            'date_diff_to_processed': int(abs((test_row['date'].iloc[0] - test_date).days))
+            'date_diff_to_processed': int(abs((test_row['date'].iloc[0] - test_date).days)),
+            'feature_importance': feature_importance
         } | quantile_predictions
         
     except Exception as e:
@@ -650,6 +660,47 @@ def run_validation(raw_data, processed_data, n_samples=None):
         )
         results_df['ensemble_weight_xgb'] = ENSEMBLE_WEIGHT_XGB
         results_df['ensemble_weight_naive'] = ENSEMBLE_WEIGHT_NAIVE
+
+    # Aggregate and analyze feature importance
+    if not results_df.empty:
+        from collections import defaultdict
+
+        all_importances = defaultdict(list)
+        for result in results:
+            if result and 'feature_importance' in result and result['feature_importance']:
+                for feat, imp in result['feature_importance'].items():
+                    all_importances[feat].append(imp)
+
+        if all_importances:
+            avg_importance = {feat: np.mean(imps) for feat, imps in all_importances.items()}
+            sorted_features = sorted(avg_importance.items(), key=lambda x: x[1], reverse=True)
+
+            # Save to file
+            import os
+            importance_df = pd.DataFrame(sorted_features, columns=['feature', 'avg_importance'])
+            importance_df.to_csv(os.path.join(PLOTS_OUTPUT_DIR, 'feature_importance.csv'), index=False)
+
+            print("\n" + "="*60)
+            print("FEATURE IMPORTANCE ANALYSIS")
+            print("="*60)
+            print("\nTOP 10 MOST IMPORTANT FEATURES:")
+            for i, (feat, imp) in enumerate(sorted_features[:10], 1):
+                print(f"  {i:2d}. {feat:30s} {imp:.4f}")
+
+            print("\nBOTTOM 10 LEAST IMPORTANT FEATURES:")
+            for i, (feat, imp) in enumerate(sorted_features[-10:], 1):
+                print(f"  {i:2d}. {feat:30s} {imp:.4f}")
+
+            # Identify low-importance features (< 1% of max importance)
+            if sorted_features:
+                max_importance = sorted_features[0][1]
+                threshold = 0.01 * max_importance
+                low_importance = [feat for feat, imp in sorted_features if imp < threshold]
+
+                if low_importance:
+                    print(f"\n  Low-importance features (< 1% of max):")
+                    print(f"  {', '.join(low_importance[:15])}")  # Show first 15
+                    print(f"  Total: {len(low_importance)} features")
 
     return results_df
 
