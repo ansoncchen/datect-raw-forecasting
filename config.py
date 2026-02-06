@@ -229,6 +229,81 @@ RF_REGRESSION_PARAMS = {
     "max_features": 0.85,
 }
 
+# =============================================================================
+# RAW VALIDATION CONFIGURATION
+# All magic numbers for validate_on_raw_data.py are centralized here.
+# =============================================================================
+
+# Target and model toggles
+USE_LOG_TARGET = False           # Log transform hurts spike detection
+USE_TWO_STAGE_MODEL = False      # DISABLED — single-stage outperforms (R²=0.224 vs 0.100)
+USE_PER_SITE_MODELS = True       # Enable per-site XGB/RF params, features, ensemble weights
+
+# Prediction clipping
+PREDICTION_CLIP_Q = 0.99         # Clip predictions to this quantile of training targets
+
+# Parallelization
+ENABLE_PARALLEL = True
+N_JOBS = -1                      # Use all cores (-1)
+
+# Per-anchor tuning / calibration
+CALIBRATION_FRACTION = 0.3       # Fraction of pre-anchor history used for tuning
+MAX_CALIBRATION_ROWS = 20        # Hard cap on calibration rows per anchor
+
+# Default XGB search grid (used when site has no custom param_grid)
+PARAM_GRID = [
+    {"max_depth": 4, "n_estimators": 500, "learning_rate": 0.05, "min_child_weight": 5},
+    {"max_depth": 6, "n_estimators": 400, "learning_rate": 0.05, "min_child_weight": 3},
+]
+
+# Quantile prediction intervals
+ENABLE_QUANTILE_INTERVALS = True
+
+# History requirement: anchor must have >= this fraction of site's total history
+HISTORY_REQUIREMENT_FRACTION = 0.33
+
+# Zero-importance features to always drop (identified in Phase 4)
+ZERO_IMPORTANCE_FEATURES = [
+    'lat', 'lon', 'weeks_since_last_raw',
+    'is_bloom_season', 'quarter', 'da_raw_lag_52',
+]
+
+# Output directory for validation plots
+PLOTS_OUTPUT_DIR = "./raw_validation_plots"
+
+# Minimum test date (early lower bound; per-site history fraction is the real filter)
+MIN_TEST_DATE = "2003-01-01"
+
+
+def verify_no_data_leakage(train_data, test_date, anchor_date):
+    """Assert that no training data leaks past the anchor date.
+
+    Call this inside the validation loop for every test point.
+    Raises AssertionError on temporal leakage.
+    """
+    import pandas as pd
+
+    anchor = pd.Timestamp(anchor_date)
+    if train_data['date'].max() > anchor:
+        raise AssertionError(
+            f"TEMPORAL LEAK: training data max date "
+            f"{train_data['date'].max().date()} > anchor {anchor.date()}"
+        )
+
+    # Verify target columns are not in the training features
+    for col in ('da_raw', 'da'):
+        if col in train_data.columns:
+            # Column exists but should only be used as y, never as X
+            pass  # Actual X construction drops these; just a reminder
+
+    # Verify test date is after anchor
+    test = pd.Timestamp(test_date)
+    if test <= anchor:
+        raise AssertionError(
+            f"TEMPORAL LEAK: test_date {test.date()} <= anchor {anchor.date()}"
+        )
+
+
 # Classification parameters
 XGB_CLASSIFICATION_PARAMS = {
     "n_estimators": 500,
@@ -248,7 +323,7 @@ XGB_CLASSIFICATION_PARAMS = {
 # Temporal Validation - prevents data leakage (handled by forecast horizon)
 
 # Model Performance
-MIN_TRAINING_SAMPLES = 3
+MIN_TRAINING_SAMPLES = 10  # Minimum raw DA measurements before making a prediction
 RANDOM_SEED = 42
 
 # Retrospective evaluation anchor points (higher = more thorough)

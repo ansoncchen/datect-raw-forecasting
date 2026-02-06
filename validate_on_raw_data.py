@@ -37,6 +37,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import config
+from config import verify_no_data_leakage
 from forecasting.model_factory import build_xgb_regressor, build_rf_regressor
 from forecasting.raw_data_forecaster import (
     aggregate_raw_to_weekly,
@@ -46,7 +47,6 @@ from forecasting.raw_data_forecaster import (
     get_site_training_frame,
     recompute_test_row_persistence_features,
 )
-from forecasting.sample_weights import compute_spike_focused_weights
 from forecasting.per_site_models import (
     apply_site_xgb_params,
     apply_site_rf_params,
@@ -68,53 +68,25 @@ except ImportError:
     print("Warning: Plotly not available. Plots will not be generated.")
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION — all values imported from config.py
 # =============================================================================
 
-# Minimum training samples required before making a prediction
-MIN_TRAINING_SAMPLES = 10
-
-# Forecast horizon (how far ahead we're predicting)
-FORECAST_HORIZON_DAYS = config.FORECAST_HORIZON_DAYS  # 7 days (1 week)
-
-# Minimum date for test samples (need enough history to train).
-# We now rely primarily on a per-site history fraction rule (see run_validation),
-# so this is just a very early lower bound.
-MIN_TEST_DATE = "2003-01-01"
-
-# Spike threshold for binary classification metrics
-SPIKE_THRESHOLD = config.SPIKE_THRESHOLD  # 20 μg/g
-
-# Random seed for reproducibility
-RANDOM_SEED = 42
-
-# Output directory for plots
-PLOTS_OUTPUT_DIR = "./raw_validation_plots"
-
-# Optional quantile prediction intervals (extra models per sample)
-ENABLE_QUANTILE_INTERVALS = True
-
-# Stabilization settings
-USE_LOG_TARGET = False  # Test without log transform - preserves spike magnitude
-PREDICTION_CLIP_Q = 0.99
-
-# Parallelization settings
-ENABLE_PARALLEL = True
-N_JOBS = -1  # Use all cores
-
-# Calibration/tuning
-CALIBRATION_FRACTION = 0.3  # Per-anchor fraction of historical rows for tuning/calibration
-MAX_CALIBRATION_ROWS = 20   # Hard cap on calibration rows to keep tuning tractable
-PARAM_GRID = [
-    {"max_depth": 4, "n_estimators": 500, "learning_rate": 0.05, "min_child_weight": 5},
-    {"max_depth": 6, "n_estimators": 400, "learning_rate": 0.05, "min_child_weight": 3},
-]
-
-# Two-stage model (classifier → regressor)
-USE_TWO_STAGE_MODEL = False  # DISABLED - tested both architectures, single-stage performs better (R²=0.224 vs 0.100)
-
-# Per-site model configurations (Phase 9)
-USE_PER_SITE_MODELS = True  # Enable site-specific XGB params, features, ensemble weights
+MIN_TRAINING_SAMPLES = config.MIN_TRAINING_SAMPLES
+FORECAST_HORIZON_DAYS = config.FORECAST_HORIZON_DAYS
+MIN_TEST_DATE = config.MIN_TEST_DATE
+SPIKE_THRESHOLD = config.SPIKE_THRESHOLD
+RANDOM_SEED = config.RANDOM_SEED
+PLOTS_OUTPUT_DIR = config.PLOTS_OUTPUT_DIR
+ENABLE_QUANTILE_INTERVALS = config.ENABLE_QUANTILE_INTERVALS
+USE_LOG_TARGET = config.USE_LOG_TARGET
+PREDICTION_CLIP_Q = config.PREDICTION_CLIP_Q
+ENABLE_PARALLEL = config.ENABLE_PARALLEL
+N_JOBS = config.N_JOBS
+CALIBRATION_FRACTION = config.CALIBRATION_FRACTION
+MAX_CALIBRATION_ROWS = config.MAX_CALIBRATION_ROWS
+PARAM_GRID = config.PARAM_GRID
+USE_PER_SITE_MODELS = config.USE_PER_SITE_MODELS
+HISTORY_REQUIREMENT_FRACTION = config.HISTORY_REQUIREMENT_FRACTION
 
 # =============================================================================
 # RAW DATA LOADING
@@ -324,10 +296,8 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
     train_data = add_temporal_features(train_data)
     test_row = add_temporal_features(test_row)
     
-    # Prepare features - Drop both raw and processed targets + zero-importance features
-    drop_cols = ['date', 'site', 'da_raw', 'da',
-                  # Zero/near-zero importance features from analysis:
-                  'lat', 'lon', 'weeks_since_last_raw', 'is_bloom_season', 'quarter', 'da_raw_lag_52']
+    # Prepare features - Drop targets + zero-importance features (from config)
+    drop_cols = ['date', 'site', 'da_raw', 'da'] + config.ZERO_IMPORTANCE_FEATURES
 
     # Per-site feature subsetting: extend drop_cols to keep only site-relevant features
     if USE_PER_SITE_MODELS:
@@ -341,77 +311,46 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
         if USE_LOG_TARGET:
             y_train = np.log1p(y_train)
 
-        sample_weight = None
-        if config.USE_REGRESSION_SAMPLE_WEIGHTS:
-            sample_weight = compute_spike_focused_weights(
-                y_train_raw,
-                SPIKE_THRESHOLD,
-                config.SPIKE_FALSE_NEGATIVE_WEIGHT,
-                config.SPIKE_TRUE_NEGATIVE_WEIGHT,
-            )
-        
         # Fit transformer on training data only
         X_train_processed = transformer.fit_transform(X_train)
-        
+
         # CRITICAL: Use test_row features (environmental data from test date)
         # This matches the original pipeline!
         X_test = test_row.drop(columns=drop_cols, errors='ignore')
         X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
         X_test_processed = transformer.transform(X_test)
-        
-        # Train model (two-stage or single-stage)
-        spike_probability = None
 
-        if USE_TWO_STAGE_MODEL:
-            # Two-stage architecture: Classifier → Regressor
-            from forecasting.two_stage_model import train_two_stage_model, predict_two_stage
+        # Temporal integrity check
+        verify_no_data_leakage(train_data, test_date, anchor_date)
 
-            classifier, regressor = train_two_stage_model(
-                X_train_processed, y_train_raw,
-                model_params=model_params,
-                spike_threshold=SPIKE_THRESHOLD,
-                sample_weight=sample_weight
-            )
+        # Train XGBoost regressor
+        model = build_xgb_regressor(model_params)
 
-            raw_prediction, spike_probability = predict_two_stage(
-                classifier, regressor, X_test_processed,
-                spike_threshold=SPIKE_THRESHOLD
-            )
+        # Try early stopping, fall back to regular fit if it fails
+        try:
+            if len(X_train_processed) > 15:  # Need enough samples for 80/20 split
+                val_split = int(0.8 * len(X_train_processed))
+                X_es_train = X_train_processed[:val_split]
+                X_es_val = X_train_processed[val_split:]
+                y_es_train = y_train[:val_split]
+                y_es_val = y_train[val_split:]
 
-            # Use the regressor for quantile predictions and feature importance
-            model = regressor
-        else:
-            # Single-stage XGBoost regressor
-            model = build_xgb_regressor(model_params)
+                model.fit(
+                    X_es_train, y_es_train,
+                    eval_set=[(X_es_val, y_es_val)],
+                    verbose=False
+                )
+            else:
+                model.fit(X_train_processed, y_train)
+        except Exception:
+            # Early stopping failed, use regular fit
+            model.fit(X_train_processed, y_train)
 
-            # Try early stopping, fall back to regular fit if it fails
-            try:
-                if len(X_train_processed) > 15:  # Need enough samples for 80/20 split
-                    val_split = int(0.8 * len(X_train_processed))
-                    X_es_train = X_train_processed[:val_split]
-                    X_es_val = X_train_processed[val_split:]
-                    y_es_train = y_train[:val_split]
-                    y_es_val = y_train[val_split:]
-                    w_es_train = sample_weight[:val_split] if sample_weight is not None else None
-
-                    model.fit(
-                        X_es_train, y_es_train,
-                        sample_weight=w_es_train,
-                        eval_set=[(X_es_val, y_es_val)],
-                        verbose=False
-                    )
-                else:
-                    # Too few samples for split
-                    model.fit(X_train_processed, y_train, sample_weight=sample_weight)
-            except Exception:
-                # Early stopping failed, use regular fit
-                model.fit(X_train_processed, y_train, sample_weight=sample_weight)
-
-            raw_prediction = float(model.predict(X_test_processed)[0])
+        raw_prediction = float(model.predict(X_test_processed)[0])
 
         # Postprocess prediction
         def _postprocess_prediction(value: float) -> float:
-            if USE_LOG_TARGET and not USE_TWO_STAGE_MODEL:
+            if USE_LOG_TARGET:
                 value = np.expm1(value)
             value = max(0.0, value)
 
@@ -462,7 +401,7 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
                         "quantile_alpha": q,
                     }
                     q_model = build_xgb_regressor(quantile_params)
-                    q_model.fit(X_train_processed, y_train, sample_weight=sample_weight)
+                    q_model.fit(X_train_processed, y_train)
                     q_pred = float(q_model.predict(X_test_processed)[0])
                     quantile_predictions[f"predicted_p{int(q * 100)}"] = _postprocess_prediction(q_pred)
             except Exception:
@@ -496,10 +435,6 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
             'date_diff_to_processed': int(abs((test_row['date'].iloc[0] - test_date).days)),
             'feature_importance': feature_importance
         }
-
-        # Add spike probability if using two-stage model
-        if spike_probability is not None:
-            result['spike_probability'] = float(spike_probability)
 
         return result | quantile_predictions
         
@@ -629,7 +564,7 @@ def run_validation(raw_data, processed_data, n_samples=None):
         total_site_raw = site_total_counts.get(site, 0)
         if total_site_raw == 0:
             continue
-        min_required_history_raw = int(np.ceil(0.33 * total_site_raw))
+        min_required_history_raw = int(np.ceil(HISTORY_REQUIREMENT_FRACTION * total_site_raw))
         # enforce at least MIN_TRAINING_SAMPLES raw points as well
         min_required_history_raw = max(min_required_history_raw, MIN_TRAINING_SAMPLES)
 

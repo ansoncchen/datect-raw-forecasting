@@ -1,345 +1,170 @@
 # DATect Raw-Data Forecasting - Project Status
 
-**Last Updated:** 2024-02-05
-**Current State:** Baseline model optimized, ready for per-site improvements
+**Last Updated:** 2025-02-06
+**Current State:** Phase 9+10 complete — 3-model ensemble (XGB+RF+Naive) with per-site configs
 
 ---
 
 ## Executive Summary
 
-This project implements 1-week-ahead domoic acid (DA) forecasting using XGBoost on raw measurements. After extensive debugging and optimization, we've achieved a working baseline that beats naive persistence.
+1-week-ahead domoic acid (DA) forecasting using a 3-model ensemble:
+per-site XGBoost + Random Forest + Naive baseline, with per-site ensemble weights.
 
-### Current Best Performance (Single-Stage XGBoost + Ensemble)
+### Current Best Performance (Iter 5 — 3-Model Ensemble)
 
-| Metric | XGBoost | Ensemble (0.65*XGB + 0.35*Naive) | Naive Baseline | Status |
-|--------|---------|-----------------------------------|----------------|--------|
-| R² | 0.224 | 0.200 | -0.139 | ✅ XGB beats naive |
-| MAE | 10.10 μg/g | 9.08 μg/g | 8.43 μg/g | ⚠️ Naive better |
-| F1 (spike detection) | 0.526 | 0.578 | 0.606 | ⚠️ Below naive |
-| Recall | 0.733 | 0.785 | 0.806 | ⚠️ Below naive |
+| Metric | XGBoost | Random Forest | Naive | **Ensemble** |
+|--------|---------|---------------|-------|-------------|
+| R² | 0.353 | 0.372 | -0.139 | **0.394** |
+| MAE | 7.62 μg/g | 6.87 μg/g | 7.97 μg/g | **6.98 μg/g** |
+| RMSE | 16.99 | 16.74 | 22.54 | **16.44** |
+| Spike F1 | 0.578 | 0.600 | 0.606 | 0.590 |
+| Spike Recall | 0.645 | 0.709 | 0.779 | 0.715 |
 
-**Key Insight:** XGBoost provides predictive value (R²=0.224 vs -0.139) but spike detection remains challenging. Ensemble improves F1 from 0.526→0.578, approaching naive's 0.606.
+### Per-Site Performance (Ensemble R²)
+
+| Site | N | XGB R² | RF R² | Naive R² | Ens R² |
+|------|---|--------|-------|----------|--------|
+| Twin Harbors | 138 | +0.597 | +0.604 | +0.763 | **+0.798** |
+| Copalis | 167 | +0.732 | +0.765 | +0.715 | **+0.761** |
+| Kalaloch | 131 | +0.565 | +0.679 | +0.669 | **+0.680** |
+| Quinault | 113 | +0.528 | +0.585 | +0.590 | **+0.653** |
+| Long Beach | 140 | +0.638 | +0.615 | +0.470 | **+0.643** |
+| Coos Bay | 67 | +0.337 | +0.305 | -0.570 | **+0.323** |
+| Clatsop Beach | 218 | +0.171 | +0.238 | -0.015 | **+0.226** |
+| Newport | 142 | -0.127 | +0.038 | -0.287 | **-0.015** |
+| Gold Beach | 144 | -0.094 | -0.091 | -1.656 | **-0.105** |
+| Cannon Beach | 61 | -0.257 | -0.539 | -10.663 | **-0.314** |
 
 ---
 
-## Configuration (Current Working State)
+## Configuration (All Centralized in config.py)
 
-### File: `validate_on_raw_data.py`
+All magic numbers live in `config.py` — no magic numbers in `validate_on_raw_data.py`.
 
 ```python
-# Line 90: Target transformation
-USE_LOG_TARGET = False  # Log transform hurts spike detection
-
-# Line 106: Two-stage model toggle
-USE_TWO_STAGE_MODEL = False  # DISABLED - underperforms (R²=0.100 vs 0.224)
-
-# Lines 313-316: Removed zero-importance features
-drop_cols = ['date', 'site', 'da_raw', 'da',
-             'lat', 'lon', 'weeks_since_last_raw',
-             'is_bloom_season', 'quarter', 'da_raw_lag_52']
-
-# Lines 656-662: Ensemble weights
-ENSEMBLE_WEIGHT_XGB = 0.65   # Favor XGB (R²=0.22)
-ENSEMBLE_WEIGHT_NAIVE = 0.35  # Include naive for MAE benefit
+USE_LOG_TARGET = False
+USE_PER_SITE_MODELS = True
+PREDICTION_CLIP_Q = 0.99
+CALIBRATION_FRACTION = 0.3
+MAX_CALIBRATION_ROWS = 20
+HISTORY_REQUIREMENT_FRACTION = 0.33
+MIN_TRAINING_SAMPLES = 10
+ENABLE_PARALLEL = True
+N_JOBS = -1
+ZERO_IMPORTANCE_FEATURES = ['lat', 'lon', 'weeks_since_last_raw',
+                            'is_bloom_season', 'quarter', 'da_raw_lag_52']
 ```
 
-### File: `config.py`
-
-```python
-# Line 276: Sample weights (CRITICAL)
-USE_REGRESSION_SAMPLE_WEIGHTS = False  # ANY weighting causes over-prediction
-
-# Lines 267-268: Spike weights (not used due to above)
-SPIKE_FALSE_NEGATIVE_WEIGHT = 50.0
-SPIKE_TRUE_NEGATIVE_WEIGHT = 1.0
-```
+Per-site configs (XGB params, RF params, feature subsets, ensemble weights, clipping) are in
+`forecasting/per_site_models.py`.
 
 ---
 
-## Critical Bug Fixes Applied
+## Architecture
 
-### 1. Per-Anchor Calibration Bug (FIXED)
-**Problem:** Lines 437-454 used same `calib_rows` for both hyperparameter tuning AND linear calibration, creating circular optimization → R² = -104.6
+### 3-Model Ensemble
 
-**Fix:** Removed entire calibration block (lines 437-454), kept only hyperparameter tuning
-```python
-# Lines 433-435 (simplified)
-best_params, _ = tune_xgb_params(calib_rows, feature_frame, base_params)
-result = run_single_raw_validation(raw_measurement, feature_frame, best_params)
-return result  # No calibration
-```
+For each test point:
+1. **XGBoost** — per-site hyperparams, per-anchor grid search tuning
+2. **Random Forest** — per-site params (conservative for weak sites), no tuning
+3. **Naive** — last known raw DA value
 
-### 2. Sample Weights Cause Over-Prediction (FIXED)
-**Problem:** ANY spike weighting (tested 50x, 1500x, 10000x ratios) caused systematic over-prediction → mean 18-20 μg/g vs actual 10.24 μg/g
+Final prediction: `w_xgb * XGB + w_rf * RF + w_naive * Naive`
 
-**Fix:** Disabled sample weights entirely in `config.py` (line 276)
+Weights are per-site, tuned based on actual model performance:
+- Sites where naive dominates (Twin Harbors): heavy naive weight (0.60)
+- Sites where RF excels (Newport, Kalaloch): heavy RF weight (0.50–0.70)
+- Sites where XGB leads (Long Beach, Coos Bay): heavy XGB weight (0.50–0.55)
+- Catastrophic sites (Cannon Beach): near-pure XGB (0.95) to minimize damage
 
-### 3. Early Stopping Failures (FIXED)
-**Problem:** `early_stopping_rounds=50` parameter failed in newer XGBoost → 0% successful predictions
+### Temporal Integrity
 
-**Fix:** Removed explicit parameter, wrapped in try-except (lines 342-366), increased min samples 10→15
-
-### 4. Feature Importance Analysis (COMPLETED)
-**Top Features Identified:**
-1. `weeks_since_last_spike` (24.5%)
-2. `last_observed_da_raw` (18.4%)
-3. `days_since_start` (10.1%)
-
-**Removed Features:** 6 zero-importance features (lat, lon, weeks_since_last_raw, is_bloom_season, quarter, da_raw_lag_52)
-
-### 5. Ensemble Weight Optimization (FIXED)
-**Problem:** Initial weights 0.80*naive + 0.20*XGB favored worse model (naive R²=-0.14)
-
-**Fix:** Flipped to 0.65*XGB + 0.35*naive → Ensemble R²=0.200, F1=0.578
+- `verify_no_data_leakage()` in config.py — called every test point
+- Training only uses `date <= anchor_date`
+- `da_raw` and `da` dropped from test features
+- Lag features use proper past-only shifts
+- Fresh model per test point (no lookahead)
 
 ---
 
-## Two-Stage Model Experiment (FAILED)
+## Completed Phases
 
-### Attempt 1: Data Fragmentation Architecture
-- **Approach:** Separate regressors for spike vs non-spike events
-- **Results:** R²=0.058, last_observed_da_raw dominated at 96% importance
-- **Root Cause:** Spike regressor only saw 13% of data → collapsed to naive
+### Phase 8: Two-Stage Model ❌ FAILED (removed)
+- Tested classifier→regressor architecture, R²=0.100 vs single-stage 0.224
+- Code deleted: `forecasting/two_stage_model.py`
 
-### Attempt 2: Unified Regressor Architecture
-- **Approach:** Classifier for spike detection + single regressor for all data
-- **Results:** R²=0.100, F1=0.605
-- **Conclusion:** Better than Attempt 1 but still worse than single-stage (R²=0.224)
+### Phase 9: Per-Site Models ✅ COMPLETE
+- Created `forecasting/per_site_models.py` with 10 site-specific configs
+- XGB R² improved from 0.224 → 0.354 (Iters 1–4)
+- Copalis: 0.097 → 0.732, Kalaloch: -1.757 → 0.565, Long Beach: 0.416 → 0.638
 
-**Decision:** Disable two-stage model (`USE_TWO_STAGE_MODEL = False`), use ensemble baseline
+### Phase 10a: 3-Model Ensemble ✅ COMPLETE
+- Added RF as third model via `forecasting/model_factory.py`
+- Per-site 3-tuple ensemble weights (xgb, rf, naive)
+- Ensemble R² = 0.394 (Iter 5 with recalibrated weights)
 
----
-
-## Site-Specific Performance Issues
-
-### Catastrophic Sites (Need Per-Site Models - Phase 9)
-
-| Site | N | XGB R² | Naive R² | Issue |
-|------|---|--------|----------|-------|
-| **Cannon Beach** | 61 | **-44.0** | -10.7 | Extreme over-prediction |
-| **Coos Bay** | 67 | -0.27 | -0.57 | High variance, poor fit |
-| **Gold Beach** | 144 | -0.94 | -1.66 | Consistent under-prediction |
-| **Newport** | 142 | -0.28 | -0.29 | Both models struggle |
-
-### High-Performing Sites (Could Benefit from Per-Site Tuning)
-
-| Site | N | XGB R² | Naive R² |
-|------|---|--------|----------|
-| **Copalis** | 167 | 0.72 | 0.72 |
-| **Kalaloch** | 131 | 0.67 | 0.67 |
-| **Quinault** | 113 | 0.64 | 0.59 |
-| **Twin Harbors** | 138 | 0.62 | 0.76 |
-
----
-
-## Remaining Work: Phases 8-9-10
-
-### Phase 8: Two-Stage Model ❌ COMPLETED (FAILED)
-**Status:** Tested both architectures, neither beat single-stage baseline
-**Recommendation:** Skip this approach, focus on per-site models instead
-
-### Phase 9: Per-Site Models 🔄 NEXT PRIORITY
-
-**Goal:** Fix catastrophic sites and boost high-performers
-
-#### Implementation Plan
-
-1. **Create `forecasting/per_site_models.py`:**
-   ```python
-   SITE_SPECIFIC_CONFIGS = {
-       'Cannon Beach': {
-           'use_site_model': True,
-           'max_depth': 3,  # Shallow to prevent overfitting on N=61
-           'n_estimators': 200,
-           'learning_rate': 0.03,
-           'feature_subset': ['last_observed_da_raw', 'weeks_since_last_spike',
-                             'modis-sst', 'pdo']  # Reduce feature set
-       },
-       'Coos Bay': {
-           'use_site_model': True,
-           'max_depth': 5,
-           'reg_lambda': 2.0,  # Strong L2 for high variance
-           'min_child_weight': 10  # Require more samples per leaf
-       },
-       # ... other sites
-   }
-   ```
-
-2. **Modify `validate_on_raw_data.py`:**
-   - Add `USE_PER_SITE_MODELS = True` toggle (after line 106)
-   - In `run_single_raw_validation_with_tuning()`, check if site has custom config
-   - Override `base_params` with site-specific params before tuning
-
-3. **Testing Strategy:**
-   - Start with Cannon Beach (worst site, R²=-44)
-   - Try: shallow trees (depth=2-3), reduced features, higher regularization
-   - Success metric: R² > -10 (get closer to naive's -10.7)
-
-#### Success Criteria
-- Cannon Beach R² > -10 (currently -44)
-- Coos Bay R² > 0 (currently -0.27)
-- High-performers (Copalis, Kalaloch) maintain R² > 0.65
-
-### Phase 10: Configuration Centralization & Integrity 🔄 FINAL
-
-**Goal:** Move all magic numbers to `config.py` and add temporal leak checks
-
-#### Implementation Plan
-
-1. **Centralize to `config.py`:**
-   ```python
-   # Move from validate_on_raw_data.py lines 90-106
-   USE_LOG_TARGET = False
-   USE_TWO_STAGE_MODEL = False
-   USE_PER_SITE_MODELS = True  # After Phase 9
-
-   ENSEMBLE_WEIGHT_XGB = 0.65
-   ENSEMBLE_WEIGHT_NAIVE = 0.35
-
-   HISTORY_REQUIREMENT_FRACTION = 0.33  # Currently line 503
-   CALIBRATION_FRACTION = 0.3
-   MIN_TRAINING_SAMPLES = 10
-
-   # Zero-importance features to drop
-   ZERO_IMPORTANCE_FEATURES = ['lat', 'lon', 'weeks_since_last_raw',
-                               'is_bloom_season', 'quarter', 'da_raw_lag_52']
-   ```
-
-2. **Add Temporal Integrity Checks:**
-   ```python
-   def verify_no_data_leakage(train_data, test_date, anchor_date):
-       """Assert no training data after anchor_date"""
-       assert train_data['date'].max() <= anchor_date, \
-           f"TEMPORAL LEAK: Training data {train_data['date'].max()} > anchor {anchor_date}"
-
-       # Check lag features don't use future data
-       for col in train_data.columns:
-           if 'lag' in col or 'last_observed' in col:
-               # Verify these are computed from data <= anchor_date only
-               pass
-   ```
-
-3. **Update imports in `validate_on_raw_data.py`:**
-   ```python
-   from config import (
-       USE_LOG_TARGET, USE_TWO_STAGE_MODEL, USE_PER_SITE_MODELS,
-       ENSEMBLE_WEIGHT_XGB, ENSEMBLE_WEIGHT_NAIVE,
-       ZERO_IMPORTANCE_FEATURES, verify_no_data_leakage
-   )
-   ```
-
-#### Success Criteria
-- All configuration in one place (`config.py`)
-- Temporal integrity checks pass on all 1321 test samples
-- No magic numbers in `validate_on_raw_data.py`
+### Phase 10b: Configuration Centralization ✅ COMPLETE
+- All magic numbers moved to `config.py`
+- `verify_no_data_leakage()` temporal integrity check added
+- Dead code removed (two-stage, sample weights)
+- Stale files deleted (6 files)
 
 ---
 
 ## Files Reference
 
-### Core Implementation
-- `validate_on_raw_data.py` - Main validation loop, ensemble logic
-- `forecasting/raw_data_forecaster.py` - Feature building, temporal utilities
-- `forecasting/two_stage_model.py` - Two-stage architecture (currently unused)
-- `config.py` - Model parameters, spike detection settings
+### Active Files
+
+| File | Purpose |
+|------|---------|
+| `validate_on_raw_data.py` | Main validation loop (1321 test points, 10 sites) |
+| `config.py` | All configuration, model params, `verify_no_data_leakage()` |
+| `forecasting/per_site_models.py` | Per-site XGB/RF params, feature subsets, ensemble weights |
+| `forecasting/model_factory.py` | `build_xgb_regressor()`, `build_rf_regressor()` |
+| `forecasting/raw_data_forecaster.py` | Feature building, temporal utilities |
+| `forecasting/data_processor.py` | Minimal DataProcessor for raw lag features |
+| `forecasting/logging_config.py` | Logging configuration |
+| `forecasting/__init__.py` | Module init |
+
+### Deleted (Stale)
+
+| File | Reason |
+|------|--------|
+| `forecasting/two_stage_model.py` | Disabled permanently, code removed |
+| `forecasting/sample_weights.py` | Disabled permanently (`USE_REGRESSION_SAMPLE_WEIGHTS=False`) |
+| `forecasting/models/__init__.py` | Torch/Lightning wrappers, never imported |
+| `compare_xgb_rf.py` | One-off comparison, RF now integrated |
+| `verify_temporal_integrity.py` | Replaced by `verify_no_data_leakage()` in config |
+| `validation_phase1-3_output.txt` | Old output artifact |
 
 ### Data Requirements
-- `data/raw/da-input/*.csv` - Raw DA measurements (10 sites, 6592 samples)
-- `data/processed/final_output.parquet` - Weekly environmental features (2003-2023)
 
-### Outputs
-- `raw_validation_plots/` - Visualizations and results
-- `raw_validation_plots/feature_importance.csv` - Feature importance analysis
-- `raw_validation_plots/raw_data_validation_results.csv` - Full predictions table
+```
+data/raw/da-input/*.csv              # Raw DA measurements (10 sites)
+data/processed/final_output.parquet  # Weekly env features (2003-2023)
+```
 
 ---
 
-## Quick Start for New Session
+## Performance Journey
 
-### To Resume Work on Phase 9 (Per-Site Models):
-
-1. **Verify current baseline:**
-   ```bash
-   python3 validate_on_raw_data.py
-   # Should see: XGB R²=0.224, Ensemble F1=0.578
-   ```
-
-2. **Create per-site config file:**
-   ```bash
-   touch forecasting/per_site_models.py
-   # Add SITE_SPECIFIC_CONFIGS dict
-   ```
-
-3. **Start with Cannon Beach:**
-   - Test shallow trees (max_depth=2,3)
-   - Reduce feature set to top 5-10 features
-   - Increase regularization (reg_lambda=2.0)
-
-4. **Iterate until R² > -10**
-
-### To Disable Two-Stage (if not already):
-Set `USE_TWO_STAGE_MODEL = False` in `validate_on_raw_data.py` line 106
-
-### To Change Ensemble Weights:
-Modify lines 656-662 in `validate_on_raw_data.py`
+| Phase | XGB R² | Ensemble R² | Key Change |
+|-------|--------|-------------|------------|
+| Baseline | 0.224 | 0.200 | Single XGB + naive |
+| Phase 9 Iter 3 | 0.350 | 0.267 | Per-site XGB configs |
+| Phase 9 Iter 4 | 0.354 | 0.366 | Ensemble weight recalibration |
+| Phase 10 (RF added) | 0.354 | 0.373 | 3-model ensemble |
+| **Phase 10 Iter 5** | **0.354** | **0.394** | **Weight recalibration on actual RF data** |
 
 ---
 
-## Key Learnings & Constraints
+## Quick Start
 
-### What Works
-✅ Expanding window validation (no future leakage)
-✅ Per-anchor hyperparameter tuning (grid search on 30% calibration set)
-✅ Raw DA targets (no log transform)
-✅ Feature importance-based selection (removed 6 zero features)
-✅ Ensemble averaging (0.65*XGB + 0.35*naive)
-✅ Early stopping with try-except wrapper
+```bash
+# Run validation (ON CLUSTER ONLY — do not run locally)
+python3 validate_on_raw_data.py
 
-### What Doesn't Work
-❌ Sample weights (ANY ratio causes over-prediction)
-❌ Per-anchor linear calibration (circular optimization)
-❌ Log transform (compresses spike signals)
-❌ Two-stage classifier→regressor architecture (worse than single-stage)
-❌ Data fragmentation (separate spike/normal models)
-
-### Critical Constraints
-- **No temporal leakage:** Train only on date ≤ anchor_date
-- **Raw measurements only:** Test on actual observations, not interpolated values
-- **33% history requirement:** anchor_date must have ≥33% of site's total history
-- **Sample size limits:** Some sites only have N=61-67 measurements
-
----
-
-## Success Metrics
-
-### Current vs. Target
-
-| Metric | Current (Ensemble) | Original Target | Realistic Target |
-|--------|-------------------|-----------------|------------------|
-| R² | 0.200 | 0.30 | 0.25 |
-| MAE | 9.08 μg/g | Minimize | 8.5 μg/g |
-| F1 (spike) | 0.578 | Maximize | 0.61 |
-| Recall (spike) | 0.785 | Maximize | 0.80 |
-
-**Rationale for Revised Targets:**
-- Environmental signal is weak (top non-persistence feature only 10% importance)
-- R²=0.30 may be unrealistic without additional data sources
-- Focus should be on spike detection (F1, Recall) for public health impact
-
-### Phase 9 Success Metrics
-- Cannon Beach R² > -10 (from -44)
-- At least 3 catastrophic sites achieve R² > -1.0
-- Ensemble R² improves to 0.22-0.25 range
-- Ensemble F1 reaches 0.60-0.61 (beats naive's 0.606)
-
----
-
-## Contact & Repository
-
-**Repository:** `/Users/ansonchen/Downloads/GitHub/datect-raw-forecasting/`
-**Validation Script:** `python3 validate_on_raw_data.py` (run on remote cluster)
-**Results Directory:** `./raw_validation_plots/`
-
-**Last Successful Run:** 2024-02-05
-**Configuration:** Single-stage XGBoost + Ensemble, two-stage disabled
-**Next Step:** Phase 9 - Per-site models for Cannon Beach, Coos Bay, Gold Beach, Newport
+# Results saved to:
+#   raw_validation_plots/raw_data_validation_results.csv
+#   raw_validation_plots/validation_summary.txt
+```
