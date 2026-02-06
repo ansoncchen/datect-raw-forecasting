@@ -150,10 +150,8 @@ def build_raw_feature_frame(
     merged = processor.create_raw_lag_features(
         merged, group_col="site", value_col="da_raw", lags=list(cfg.lags)
     )
-    if "da_raw_lag_1" in merged.columns and "da_raw_lag_2" in merged.columns:
-        merged["da_raw_lag_diff_1"] = merged["da_raw_lag_1"] - merged["da_raw_lag_2"]
-    if "da_raw_lag_2" in merged.columns and "da_raw_lag_3" in merged.columns:
-        merged["da_raw_lag_diff_2"] = merged["da_raw_lag_2"] - merged["da_raw_lag_3"]
+    # Observation-order diffs (da_raw_prev_obs_diff_1_2) are now computed
+    # inside create_raw_lag_features.  Old grid-shift lag diffs removed.
     return merged
 
 
@@ -222,7 +220,11 @@ def get_site_test_row(
     max_date_diff_days: int = 14,
 ) -> Optional[pd.DataFrame]:
     """
-    Find closest processed row to test_date (after anchor_date).
+    LEGACY: Find closest processed row to test_date (after anchor_date).
+
+    WARNING: This uses environmental features from the test date, which
+    constitutes data leakage for a forecasting task.  Use
+    get_site_anchor_row() instead for leak-free validation.
     """
     test_date = pd.Timestamp(test_date)
     anchor_date = pd.Timestamp(anchor_date)
@@ -236,6 +238,53 @@ def get_site_test_row(
     if future_data.loc[closest_idx, "date_diff"] > max_date_diff_days:
         return None
     return future_data.loc[[closest_idx]].drop(columns=["date_diff"])
+
+
+def get_site_anchor_row(
+    feature_frame: pd.DataFrame,
+    site: str,
+    test_date: pd.Timestamp,
+    anchor_date: pd.Timestamp,
+    max_date_diff_days: int = 28,
+) -> Optional[pd.DataFrame]:
+    """
+    Build a leak-free test row for forecasting validation.
+
+    Environmental features (SST, chlorophyll, BEUTI, etc.) come from the
+    closest processed row AT or BEFORE anchor_date — information that would
+    actually be available at prediction time.
+
+    The row's ``date`` is set to ``test_date`` so that deterministic calendar
+    features (sin_day_of_year, month, …) are computed correctly downstream.
+    Persistence / lag features should still be overwritten via
+    ``recompute_test_row_persistence_features()`` after calling this.
+    """
+    test_date = pd.Timestamp(test_date)
+    anchor_date = pd.Timestamp(anchor_date)
+    site_data = feature_frame[feature_frame["site"] == site].copy()
+    site_data = site_data.sort_values("date")
+
+    # Environmental features from anchor date or earlier
+    past_data = site_data[site_data["date"] <= anchor_date].copy()
+    if past_data.empty:
+        return None
+
+    # Most recent available env data (closest to anchor)
+    past_data["date_diff"] = abs((past_data["date"] - anchor_date).dt.days)
+    closest_idx = past_data["date_diff"].idxmin()
+
+    if past_data.loc[closest_idx, "date_diff"] > max_date_diff_days:
+        return None
+
+    anchor_row = past_data.loc[[closest_idx]].drop(columns=["date_diff"]).copy()
+
+    # Set date to test_date so temporal features will be computed for the
+    # actual prediction date (these are deterministic calendar features,
+    # not leaked observations).
+    anchor_row["date"] = test_date
+    anchor_row["site"] = site
+
+    return anchor_row
 
 
 def get_last_known_raw_da(

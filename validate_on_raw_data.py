@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Raw Data Validation Script - Matching Original Pipeline
-========================================================
+Raw Data Validation Script — Leak-Free
+=======================================
 
 This script provides a rigorous validation of the XGBoost model by testing
 ONLY on real measurements from the raw data files, not on interpolated or
 gap-filled values from the processed dataset.
 
-CRITICAL: This version matches the original forecast_engine.py approach:
-- Uses environmental features FROM THE PREDICTION DATE (not anchor date)
-- Only the DA target is truly "unknown" at prediction time
-- This is how the original pipeline works
+CRITICAL: Environmental features come from the ANCHOR DATE (not the
+prediction date) to prevent future-data leakage.  Deterministic calendar
+features (sin_day_of_year, month, etc.) are computed for the prediction
+date since they are known in advance.
 
 The validation mimics real-world usage:
 1. For each raw measurement at test_date, use anchor_date = test_date - 7 days
 2. Train XGBoost on processed data UP TO anchor_date
-3. Use environmental features from processed data AT test_date for prediction
+3. Use environmental features from processed data AT anchor_date for prediction
 4. Compare against the ACTUAL raw measurement (not processed/interpolated value)
 """
 
@@ -43,6 +43,7 @@ from forecasting.raw_data_forecaster import (
     aggregate_raw_to_weekly,
     build_raw_feature_frame,
     get_last_known_raw_da,
+    get_site_anchor_row,
     get_site_test_row,
     get_site_training_frame,
     recompute_test_row_persistence_features,
@@ -84,6 +85,7 @@ ENABLE_PARALLEL = config.ENABLE_PARALLEL
 N_JOBS = config.N_JOBS
 CALIBRATION_FRACTION = config.CALIBRATION_FRACTION
 MAX_CALIBRATION_ROWS = config.MAX_CALIBRATION_ROWS
+MIN_TUNING_SAMPLES = config.MIN_TUNING_SAMPLES
 PARAM_GRID = config.PARAM_GRID
 USE_PER_SITE_MODELS = config.USE_PER_SITE_MODELS
 HISTORY_REQUIREMENT_FRACTION = config.HISTORY_REQUIREMENT_FRACTION
@@ -275,13 +277,15 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
     if train_data is None:
         return None
 
-    test_row = get_site_test_row(
+    # Get test row with anchor-date env features (no future data leakage).
+    # Environmental features come from the closest processed row AT or BEFORE
+    # anchor_date. The row's date is set to test_date so deterministic
+    # calendar features (sin_day_of_year, month, etc.) are correct.
+    test_row = get_site_anchor_row(
         feature_frame,
         site,
         test_date,
         anchor_date,
-        # Allow a looser tolerance between raw test date and
-        # nearest processed environmental row to reduce dropouts.
         max_date_diff_days=28,
     )
     if test_row is None:
@@ -326,25 +330,12 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
         # Train XGBoost regressor
         model = build_xgb_regressor(model_params)
 
-        # Try early stopping, fall back to regular fit if it fails
-        try:
-            if len(X_train_processed) > 15:  # Need enough samples for 80/20 split
-                val_split = int(0.8 * len(X_train_processed))
-                X_es_train = X_train_processed[:val_split]
-                X_es_val = X_train_processed[val_split:]
-                y_es_train = y_train[:val_split]
-                y_es_val = y_train[val_split:]
-
-                model.fit(
-                    X_es_train, y_es_train,
-                    eval_set=[(X_es_val, y_es_val)],
-                    verbose=False
-                )
-            else:
-                model.fit(X_train_processed, y_train)
-        except Exception:
-            # Early stopping failed, use regular fit
-            model.fit(X_train_processed, y_train)
+        # Train on ALL available data (no early-stopping split).
+        # Previously, the last 20% of chronologically-sorted training data was
+        # withheld for early stopping validation, but early_stopping_rounds was
+        # never configured, so the eval_set did nothing while the most recent
+        # (most informative) data was never trained on.
+        model.fit(X_train_processed, y_train)
 
         raw_prediction = float(model.predict(X_test_processed)[0])
 
@@ -482,7 +473,7 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
         for _, row in calib_candidates.iterrows()
     ]
 
-    if len(calib_rows) < 2:
+    if len(calib_rows) < MIN_TUNING_SAMPLES:
         return run_single_raw_validation(raw_measurement, feature_frame, effective_base_params, skip_quantiles=False)
 
     # Use site-specific PARAM_GRID if available, merged with global grid as fallback
@@ -495,9 +486,20 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
             merged_grid = None
     else:
         merged_grid = None
+
+    # Short-circuit: if grid has <= 1 entry, skip tuning entirely (it's a no-op)
+    effective_grid = merged_grid if merged_grid is not None else PARAM_GRID
+    if len(effective_grid) <= 1:
+        if len(effective_grid) == 1:
+            best_params = {**effective_base_params, **effective_grid[0]}
+        else:
+            best_params = effective_base_params
+        result = run_single_raw_validation(raw_measurement, feature_frame, best_params)
+        return result
+
     best_params, _ = tune_xgb_params(calib_rows, feature_frame, effective_base_params, param_grid_override=merged_grid)
     result = run_single_raw_validation(raw_measurement, feature_frame, best_params)
-    return result  # No calibration - removed circular optimization
+    return result
 
 
 def calibrate_linear(y_true, y_pred):
@@ -582,11 +584,7 @@ def run_validation(raw_data, processed_data, n_samples=None):
             (feature_frame['date'] <= anchor_date) &
             (feature_frame['da_raw'].notna())
         ]
-        site_future = feature_frame[
-            (feature_frame['site'] == site) &
-            (feature_frame['date'] > anchor_date)
-        ]
-        if len(site_history) >= MIN_TRAINING_SAMPLES and len(site_future) > 0:
+        if len(site_history) >= MIN_TRAINING_SAMPLES:
             valid_for_testing.append(row)
     
     valid_for_testing = pd.DataFrame(valid_for_testing)
@@ -650,7 +648,7 @@ def run_validation(raw_data, processed_data, n_samples=None):
     }
     
     print(f"\nXGBoost base parameters: {base_params}")
-    print(f"\nCRITICAL: Using raw DA targets with raw lag features + test-date env features")
+    print(f"\nUsing raw DA targets with raw lag features + anchor-date env features (leak-free)")
     
     # Run validation for each sample
     print(f"\nParallel mode: {ENABLE_PARALLEL} (n_jobs={N_JOBS})")
@@ -768,8 +766,68 @@ def run_validation(raw_data, processed_data, n_samples=None):
 # METRICS CALCULATION
 # =============================================================================
 
+def compute_bootstrap_cis(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    n_iterations: int = config.N_BOOTSTRAP_ITERATIONS,
+    subsample_fraction: float = config.BOOTSTRAP_SUBSAMPLE_FRACTION,
+    percentiles: list = None,
+    spike_threshold: float = SPIKE_THRESHOLD,
+) -> dict:
+    """
+    Compute bootstrap confidence intervals for R², MAE, RMSE, and spike F1.
+
+    Returns dict mapping metric name → (lower, median, upper).
+    """
+    if percentiles is None:
+        percentiles = config.CONFIDENCE_PERCENTILES  # [5, 50, 95]
+
+    n = len(actual)
+    if n < 5:
+        return {}
+
+    rng = np.random.RandomState(RANDOM_SEED)
+    sample_size = max(5, int(n * subsample_fraction))
+
+    boot_r2, boot_mae, boot_rmse, boot_f1 = [], [], [], []
+
+    for _ in range(n_iterations):
+        idx = rng.choice(n, size=sample_size, replace=True)
+        a, p = actual[idx], predicted[idx]
+
+        # R² can be undefined if all resampled actuals are identical
+        ss_res = np.sum((a - p) ** 2)
+        ss_tot = np.sum((a - np.mean(a)) ** 2)
+        if ss_tot == 0:
+            continue
+        boot_r2.append(1 - ss_res / ss_tot)
+        boot_mae.append(np.mean(np.abs(a - p)))
+        boot_rmse.append(np.sqrt(np.mean((a - p) ** 2)))
+
+        a_spike = (a > spike_threshold).astype(int)
+        p_spike = (p > spike_threshold).astype(int)
+        if a_spike.sum() > 0:
+            boot_f1.append(f1_score(a_spike, p_spike, zero_division=0))
+
+    cis = {}
+    for name, values in [('r2', boot_r2), ('mae', boot_mae),
+                         ('rmse', boot_rmse), ('f1', boot_f1)]:
+        if len(values) >= 3:
+            lo, med, hi = np.percentile(values, percentiles)
+            cis[name] = (lo, med, hi)
+    return cis
+
+
+def _fmt_ci(point_est: float, ci_tuple, fmt: str = ".4f") -> str:
+    """Format a metric with its CI: '0.4100 [0.3500 - 0.4700]'."""
+    if ci_tuple is None:
+        return f"{point_est:{fmt}}"
+    lo, _med, hi = ci_tuple
+    return f"{point_est:{fmt}} [{lo:{fmt}} - {hi:{fmt}}]"
+
+
 def calculate_metrics(results_df):
-    """Calculate and display comprehensive metrics."""
+    """Calculate and display comprehensive metrics with bootstrap CIs."""
     print("\n" + "="*70)
     print("RAW DATA VALIDATION RESULTS")
     print("="*70)
@@ -854,40 +912,48 @@ def calculate_metrics(results_df):
         rf_precision = rf_recall = rf_f1 = 0.0
         naive_precision = naive_recall = naive_f1 = 0.0
         ensemble_precision = ensemble_recall = ensemble_f1 = 0.0
-    
+
+    # --- Bootstrap confidence intervals ---
+    print(f"\nComputing bootstrap CIs ({config.N_BOOTSTRAP_ITERATIONS} iterations, "
+          f"{config.BOOTSTRAP_SUBSAMPLE_FRACTION:.0%} subsample)...")
+    xgb_cis = compute_bootstrap_cis(actual, predicted)
+    naive_cis = compute_bootstrap_cis(actual, naive)
+    rf_cis = compute_bootstrap_cis(actual, rf_predicted) if rf_predicted is not None else {}
+    ens_cis = compute_bootstrap_cis(actual, ensemble) if ensemble is not None else {}
+
     print(f"\n{'='*60}")
     print("XGBOOST PERFORMANCE ON RAW DATA")
     print(f"{'='*60}")
     print(f"  Total predictions:     {len(results_df)}")
-    print(f"  R² Score:              {r2:.4f}")
-    print(f"  MAE:                   {mae:.4f} μg/g")
-    print(f"  RMSE:                  {rmse:.4f} μg/g")
+    print(f"  R² Score:              {_fmt_ci(r2, xgb_cis.get('r2'))}")
+    print(f"  MAE:                   {_fmt_ci(mae, xgb_cis.get('mae'))} μg/g")
+    print(f"  RMSE:                  {_fmt_ci(rmse, xgb_cis.get('rmse'))} μg/g")
     print(f"  Correlation:           {correlation:.4f}")
-    
+
     if rf_predicted is not None:
         print(f"\n{'='*60}")
         print("RANDOM FOREST PERFORMANCE")
         print(f"{'='*60}")
-        print(f"  R² Score:              {rf_r2:.4f}")
-        print(f"  MAE:                   {rf_mae:.4f} μg/g")
-        print(f"  RMSE:                  {rf_rmse:.4f} μg/g")
+        print(f"  R² Score:              {_fmt_ci(rf_r2, rf_cis.get('r2'))}")
+        print(f"  MAE:                   {_fmt_ci(rf_mae, rf_cis.get('mae'))} μg/g")
+        print(f"  RMSE:                  {_fmt_ci(rf_rmse, rf_cis.get('rmse'))} μg/g")
         print(f"  Correlation:           {rf_correlation:.4f}")
 
     print(f"\n{'='*60}")
     print("NAIVE BASELINE PERFORMANCE (Last Known DA Value)")
     print(f"{'='*60}")
-    print(f"  R² Score:              {naive_r2:.4f}")
-    print(f"  MAE:                   {naive_mae:.4f} μg/g")
-    print(f"  RMSE:                  {naive_rmse:.4f} μg/g")
+    print(f"  R² Score:              {_fmt_ci(naive_r2, naive_cis.get('r2'))}")
+    print(f"  MAE:                   {_fmt_ci(naive_mae, naive_cis.get('mae'))} μg/g")
+    print(f"  RMSE:                  {_fmt_ci(naive_rmse, naive_cis.get('rmse'))} μg/g")
     print(f"  Correlation:           {naive_correlation:.4f}")
 
     if ensemble is not None:
         print(f"\n{'='*60}")
         print("ENSEMBLE PERFORMANCE (XGB+RF+Naive)")
         print(f"{'='*60}")
-        print(f"  R² Score:              {ensemble_r2:.4f}")
-        print(f"  MAE:                   {ensemble_mae:.4f} μg/g")
-        print(f"  RMSE:                  {ensemble_rmse:.4f} μg/g")
+        print(f"  R² Score:              {_fmt_ci(ensemble_r2, ens_cis.get('r2'))}")
+        print(f"  MAE:                   {_fmt_ci(ensemble_mae, ens_cis.get('mae'))} μg/g")
+        print(f"  RMSE:                  {_fmt_ci(ensemble_rmse, ens_cis.get('rmse'))} μg/g")
         print(f"  Correlation:           {ensemble_correlation:.4f}")
     
     print(f"\n{'='*60}")
@@ -906,20 +972,20 @@ def calculate_metrics(results_df):
     print(f"    Predicted spikes:    {predicted_spike.sum()} ({100*predicted_spike.mean():.1f}%)")
     print(f"    Precision:           {precision:.4f}")
     print(f"    Recall:              {recall:.4f}")
-    print(f"    F1 Score:            {f1:.4f}")
+    print(f"    F1 Score:            {_fmt_ci(f1, xgb_cis.get('f1'))}")
     if rf_spike is not None:
         print(f"")
         print(f"  Random Forest:")
         print(f"    Predicted spikes:    {rf_spike.sum()} ({100*rf_spike.mean():.1f}%)")
         print(f"    Precision:           {rf_precision:.4f}")
         print(f"    Recall:              {rf_recall:.4f}")
-        print(f"    F1 Score:            {rf_f1:.4f}")
+        print(f"    F1 Score:            {_fmt_ci(rf_f1, rf_cis.get('f1'))}")
     print(f"")
     print(f"  Naive Baseline:")
     print(f"    Predicted spikes:    {naive_spike.sum()} ({100*naive_spike.mean():.1f}%)")
     print(f"    Precision:           {naive_precision:.4f}")
     print(f"    Recall:              {naive_recall:.4f}")
-    print(f"    F1 Score:            {naive_f1:.4f}")
+    print(f"    F1 Score:            {_fmt_ci(naive_f1, naive_cis.get('f1'))}")
 
     if ensemble_spike is not None:
         print(f"")
@@ -927,7 +993,7 @@ def calculate_metrics(results_df):
         print(f"    Predicted spikes:    {ensemble_spike.sum()} ({100*ensemble_spike.mean():.1f}%)")
         print(f"    Precision:           {ensemble_precision:.4f}")
         print(f"    Recall:              {ensemble_recall:.4f}")
-        print(f"    F1 Score:            {ensemble_f1:.4f}")
+        print(f"    F1 Score:            {_fmt_ci(ensemble_f1, ens_cis.get('f1'))}")
     
     # Site-specific breakdown
     print(f"\n{'='*60}")
@@ -1020,7 +1086,13 @@ def calculate_metrics(results_df):
         'ensemble_f1': ensemble_f1,
         'n_samples': len(results_df),
         'n_spikes': int(actual_spike.sum()),
-        'site_metrics': site_metrics
+        'site_metrics': site_metrics,
+        'bootstrap_cis': {
+            'xgb': xgb_cis,
+            'rf': rf_cis,
+            'naive': naive_cis,
+            'ensemble': ens_cis,
+        },
     }
 
 
@@ -1453,13 +1525,41 @@ def save_results(results_df, metrics, output_dir):
                     f"Naive={results_df['ensemble_weight_naive'].iloc[0]:.2f}\n")
         f.write("\n")
         
-        f.write("CRITICAL: Uses test-date environmental features (matching original pipeline)\n\n")
+        f.write("Uses anchor-date environmental features (leak-free forecasting)\n\n")
         
-        f.write("OVERALL METRICS\n")
-        for key, value in metrics.items():
-            if key != 'site_metrics':
-                f.write(f"  {key}: {value}\n")
-        
+        f.write("OVERALL METRICS (with 90% bootstrap CIs)\n")
+        boot = metrics.get('bootstrap_cis', {})
+        # Helper to format a metric line with optional CI
+        def _write_metric(f, label, value, ci_dict, ci_key, fmt=".4f"):
+            ci = ci_dict.get(ci_key) if ci_dict else None
+            f.write(f"  {label}: {_fmt_ci(value, ci, fmt)}\n")
+
+        for model_label, prefix, ci_key in [
+            ("XGBoost", "", "xgb"),
+            ("Random Forest", "rf_", "rf"),
+            ("Naive", "naive_", "naive"),
+            ("Ensemble", "ensemble_", "ensemble"),
+        ]:
+            model_cis = boot.get(ci_key, {})
+            r2_val = metrics.get(f'{prefix}r2')
+            mae_val = metrics.get(f'{prefix}mae')
+            f1_val = metrics.get(f'{prefix}f1')
+            if r2_val is None:
+                continue
+            f.write(f"\n  {model_label}:\n")
+            _write_metric(f, "    R²", r2_val, model_cis, "r2")
+            if mae_val is not None:
+                _write_metric(f, "    MAE", mae_val, model_cis, "mae")
+            rmse_val = metrics.get(f'{prefix}rmse')
+            if rmse_val is not None:
+                _write_metric(f, "    RMSE", rmse_val, model_cis, "rmse")
+            if f1_val is not None:
+                _write_metric(f, "    Spike F1", f1_val, model_cis, "f1")
+
+        # Additional scalar metrics
+        f.write(f"\n  n_samples: {metrics.get('n_samples')}\n")
+        f.write(f"  n_spikes: {metrics.get('n_spikes')}\n")
+
         f.write("\nSITE-SPECIFIC METRICS\n")
         site_metrics = metrics.get('site_metrics', {})
         for site, sm in site_metrics.items():
@@ -1483,7 +1583,7 @@ def main():
     print(f"This script tests model performance on ACTUAL raw measurements only,")
     print(f"not on interpolated or gap-filled values from the processed dataset.")
     print(f"")
-    print(f"CRITICAL: Uses test-date environmental features (like original pipeline)")
+    print(f"Uses anchor-date environmental features (leak-free forecasting)")
     print(f"")
     print(f"Configuration:")
     print(f"  - Forecast horizon: {FORECAST_HORIZON_DAYS} days")
@@ -1522,7 +1622,7 @@ def main():
             print(f"  Naive:   R² = {metrics['naive_r2']:.4f}, MAE = {metrics['naive_mae']:.2f} μg/g, F1 = {metrics['naive_f1']:.3f}")
             print(f"")
             print(f"  These metrics represent performance on REAL measurements from raw data files,")
-            print(f"  using environmental features from the test date (matching original pipeline).")
+            print(f"  using anchor-date environmental features (leak-free forecasting).")
     else:
         print("\nValidation failed - no results generated.")
 

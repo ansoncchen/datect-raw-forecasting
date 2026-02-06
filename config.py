@@ -249,6 +249,7 @@ N_JOBS = -1                      # Use all cores (-1)
 # Per-anchor tuning / calibration
 CALIBRATION_FRACTION = 0.3       # Fraction of pre-anchor history used for tuning
 MAX_CALIBRATION_ROWS = 20        # Hard cap on calibration rows per anchor
+MIN_TUNING_SAMPLES = 10          # Skip tuning if fewer calibration rows available
 
 # Default XGB search grid (used when site has no custom param_grid)
 PARAM_GRID = [
@@ -265,7 +266,7 @@ HISTORY_REQUIREMENT_FRACTION = 0.33
 # Zero-importance features to always drop (identified in Phase 4)
 ZERO_IMPORTANCE_FEATURES = [
     'lat', 'lon', 'weeks_since_last_raw',
-    'is_bloom_season', 'quarter', 'da_raw_lag_52',
+    'is_bloom_season', 'quarter',
 ]
 
 # Output directory for validation plots
@@ -337,9 +338,10 @@ N_BOOTSTRAP_ITERATIONS = 20  # Number of bootstrap iterations for confidence int
 # Enable/disable lag features for time series modeling
 USE_LAG_FEATURES = True
 
-# Time series lags optimized via ACF/PACF analysis
-# Lag 1: immediate dependency (60% sites), Lag 3: cyclical pattern (70% sites)
-LAG_FEATURES = [1, 2, 3, 4, 52] if USE_LAG_FEATURES else []
+# Observation-order lag configuration.
+# max(LAG_FEATURES) determines how many past observations to create features for.
+# E.g. [1,2,3,4] → prev_obs_1 through prev_obs_4 (capped at 4 internally).
+LAG_FEATURES = [1, 2, 3, 4] if USE_LAG_FEATURES else []
 
 # DA Category Configuration
 

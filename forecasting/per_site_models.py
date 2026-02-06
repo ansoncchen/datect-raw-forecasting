@@ -23,19 +23,21 @@ PERSISTENCE_FEATURES = [
     'weeks_since_last_spike',
 ]
 
+# Observation-order lag features (replacing grid-shift lags)
 LAG_FEATURES_SHORT = [
-    'da_raw_lag_1',
-    'da_raw_lag_2',
-    'da_raw_lag_diff_1',
+    'da_raw_prev_obs_1',
+    'da_raw_prev_obs_2',
+    'da_raw_prev_obs_diff_1_2',
 ]
 
 LAG_FEATURES_FULL = [
-    'da_raw_lag_1',
-    'da_raw_lag_2',
-    'da_raw_lag_3',
-    'da_raw_lag_4',
-    'da_raw_lag_diff_1',
-    'da_raw_lag_diff_2',
+    'da_raw_prev_obs_1',
+    'da_raw_prev_obs_2',
+    'da_raw_prev_obs_3',
+    'da_raw_prev_obs_4',
+    'da_raw_prev_obs_2_weeks_ago',
+    'da_raw_prev_obs_3_weeks_ago',
+    'da_raw_prev_obs_diff_1_2',
 ]
 
 ROLLING_FEATURES_SHORT = [
