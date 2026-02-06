@@ -87,7 +87,7 @@ PLOTS_OUTPUT_DIR = "./raw_validation_plots"
 ENABLE_QUANTILE_INTERVALS = True
 
 # Stabilization settings
-USE_LOG_TARGET = True
+USE_LOG_TARGET = False  # Test without log transform - preserves spike magnitude
 PREDICTION_CLIP_Q = 0.99
 
 # Parallelization settings
@@ -432,27 +432,7 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
 
     best_params, _ = tune_xgb_params(calib_rows, feature_frame, base_params)
     result = run_single_raw_validation(raw_measurement, feature_frame, best_params)
-    if result is None:
-        return None
-
-    # Run sequentially to avoid nested parallelization
-    # skip_quantiles=True: quantile models aren't needed for calibration
-    calib_results = [
-        run_single_raw_validation(row, feature_frame, best_params, skip_quantiles=True)
-        for row in calib_rows
-    ]
-    calib_results = [r for r in calib_results if r is not None]
-    if len(calib_results) < 2:
-        return result
-
-    calib_df = pd.DataFrame(calib_results)
-    slope, intercept = calibrate_linear(
-        calib_df["actual_da_raw"].values,
-        calib_df["predicted_da"].values,
-    )
-    result["predicted_da"] = slope * result["predicted_da"] + intercept
-    result["predicted_da"] = max(0.0, result["predicted_da"])
-    return result
+    return result  # No calibration - removed circular optimization
 
 
 def calibrate_linear(y_true, y_pred):
