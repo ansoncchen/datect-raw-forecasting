@@ -264,8 +264,8 @@ DA_CATEGORY_LABELS = [0, 1, 2, 3]
 
 # Spike Detection Configuration
 SPIKE_THRESHOLD = 20.0  # DA > 20 μg/g considered a spike event
-SPIKE_FALSE_NEGATIVE_WEIGHT = 300.0  # Penalty for missing spikes (reduced to prevent over-prediction)
-SPIKE_TRUE_NEGATIVE_WEIGHT = 0.2  # Weight for correct non-spike predictions (increased for balance)
+SPIKE_FALSE_NEGATIVE_WEIGHT = 50.0  # Conservative penalty - prevents over-prediction
+SPIKE_TRUE_NEGATIVE_WEIGHT = 1.0  # Equal weighting for balance (50x ratio)
 
 # Bootstrap subsample fraction for speed optimization
 BOOTSTRAP_SUBSAMPLE_FRACTION = 0.75  # Use 75% of data for each bootstrap iteration

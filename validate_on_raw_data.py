@@ -653,9 +653,9 @@ def run_validation(raw_data, processed_data, n_samples=None):
 
     # Add ensemble prediction only if we have predictions
     if not results_df.empty and 'predicted_da' in results_df.columns and 'naive_prediction' in results_df.columns:
-        # Favor naive more to improve MAE while keeping XGB's high recall
-        ENSEMBLE_WEIGHT_XGB = 0.35
-        ENSEMBLE_WEIGHT_NAIVE = 0.65
+        # Heavily favor naive to improve MAE - XGB only adds spike sensitivity
+        ENSEMBLE_WEIGHT_XGB = 0.20
+        ENSEMBLE_WEIGHT_NAIVE = 0.80
         results_df['ensemble_prediction'] = (
             ENSEMBLE_WEIGHT_XGB * results_df['predicted_da'] +
             ENSEMBLE_WEIGHT_NAIVE * results_df['naive_prediction']
@@ -797,7 +797,7 @@ def calculate_metrics(results_df):
 
     if ensemble is not None:
         print(f"\n{'='*60}")
-        print("ENSEMBLE PERFORMANCE (0.35*XGB + 0.65*Naive)")
+        print("ENSEMBLE PERFORMANCE (0.20*XGB + 0.80*Naive)")
         print(f"{'='*60}")
         print(f"  R² Score:              {ensemble_r2:.4f}")
         print(f"  MAE:                   {ensemble_mae:.4f} μg/g")
