@@ -91,8 +91,8 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
     # ==================================================================
 
     'Copalis': {
-        # N=167, XGB R²=0.097, Naive R²=0.715. Largest site.
-        # XGB picks up noise from env features. Strip them, use persistence only.
+        # N=167, XGB R²=0.732, Naive R²=0.715. Largest site.
+        # Persistence-only features unlocked strong XGB signal (was 0.097 baseline).
         'xgb_params': {
             'max_depth': 2,
             'n_estimators': 100,
@@ -114,14 +114,14 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ROLLING_FEATURES_SHORT
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.20, 0.80),
+        'ensemble_weights': (0.55, 0.45),
         'prediction_clip_q': 0.97,
         'prediction_clip_max': None,
     },
 
     'Kalaloch': {
-        # N=131, XGB R²=-1.757 (worst), Naive R²=0.669.
-        # XGB is actively harmful. Maximum regularization, minimal features.
+        # N=131, XGB R²=0.565, Naive R²=0.669.
+        # Was -1.757 before per-site config. Max regularization + minimal features worked.
         'xgb_params': {
             'max_depth': 2,
             'n_estimators': 80,
@@ -142,13 +142,13 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + LAG_FEATURES_SHORT
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.15, 0.85),
+        'ensemble_weights': (0.35, 0.65),
         'prediction_clip_q': 0.95,
         'prediction_clip_max': 80.0,
     },
 
     'Twin Harbors': {
-        # N=138, XGB R²=0.579, Naive R²=0.762.
+        # N=138, XGB R²=0.597, Naive R²=0.763.
         # XGB decent but naive clearly better. Limited env (SST+PDO only).
         'xgb_params': {
             'max_depth': 3,
@@ -174,13 +174,13 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ['modis-sst', 'pdo']
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.35, 0.65),
+        'ensemble_weights': (0.30, 0.70),
         'prediction_clip_q': 0.98,
         'prediction_clip_max': None,
     },
 
     'Quinault': {
-        # N=113, XGB R²=0.508, Naive R²=0.638.
+        # N=113, XGB R²=0.528, Naive R²=0.590.
         # Modest gap -- keep full env, moderate naive lean.
         'xgb_params': {
             'max_depth': 3,
@@ -212,12 +212,12 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
     },
 
     # ==================================================================
-    # PERSISTENCE-LEANING SITE -- XGB ~ naive, slight naive lean
+    # XGB-LEANING SITE -- XGB > naive, lean ensemble toward XGB
     # ==================================================================
 
     'Long Beach': {
-        # N=176 (largest), XGB R²=0.416, Naive R²=0.437.
-        # Nearly equal -- full features since N supports it, slight naive lean.
+        # N=140, XGB R²=0.638, Naive R²=0.470.
+        # XGB clearly better -- full features since N supports it.
         'xgb_params': {
             'max_depth': 3,
             'n_estimators': 250,
@@ -242,7 +242,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ENV_FEATURES_CORE
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.45, 0.55),
+        'ensemble_weights': (0.65, 0.35),
         'prediction_clip_q': 0.98,
         'prediction_clip_max': None,
     },
@@ -252,19 +252,19 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
     # ==================================================================
 
     'Clatsop Beach': {
-        # N=110, XGB R²=0.267, Naive R²=0.095.
+        # N=218, XGB R²=0.171, Naive R²=-0.015.
         # XGB clearly better -- global params work well, just adjust ensemble.
         'xgb_params': None,
         'param_grid': None,
         'feature_subset': None,
-        'ensemble_weights': (0.70, 0.30),
+        'ensemble_weights': (0.80, 0.20),
         'prediction_clip_q': None,
         'prediction_clip_max': None,
     },
 
     'Coos Bay': {
-        # N=67, XGB R²=0.302, Naive R²=-0.127.
-        # XGB much better than naive. Keep Iter 1 regularization, boost XGB weight.
+        # N=67, XGB R²=0.337, Naive R²=-0.570.
+        # XGB much better than naive. Near-pure XGB ensemble.
         'xgb_params': {
             'max_depth': 3,
             'n_estimators': 200,
@@ -289,19 +289,19 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ENV_FEATURES_CORE
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.75, 0.25),
+        'ensemble_weights': (0.90, 0.10),
         'prediction_clip_q': 0.97,
         'prediction_clip_max': None,
     },
 
     # ==================================================================
     # BOTH-STRUGGLE SITES -- both XGB and naive have negative R²
-    # Aggressive regularization, feature reduction, lean naive
+    # Aggressive regularization, feature reduction, lean XGB (naive is worse)
     # ==================================================================
 
     'Cannon Beach': {
-        # N=61 (smallest), XGB R²=-0.510 (was -44 before Iter 1).
-        # Ultra-shallow trees, minimal features, tight clip, heavy naive lean.
+        # N=61 (smallest), XGB R²=-0.257, Naive R²=-10.663.
+        # Was -44 before Iter 1. Naive is catastrophic -- near-pure XGB ensemble.
         'xgb_params': {
             'max_depth': 2,
             'n_estimators': 100,
@@ -323,14 +323,14 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + TEMPORAL_FEATURES_CORE
             + ['modis-sst', 'pdo']
         ),
-        'ensemble_weights': (0.25, 0.75),
+        'ensemble_weights': (0.95, 0.05),
         'prediction_clip_q': 0.95,
         'prediction_clip_max': 80.0,
     },
 
     'Gold Beach': {
-        # N=144, XGB R²=-0.247 (was -0.94 before Iter 1).
-        # Tighten from Iter 1: depth 2, more regularization, lean naive.
+        # N=144, XGB R²=-0.094, Naive R²=-1.656.
+        # Was -0.94 before Iter 1. Naive is terrible -- near-pure XGB ensemble.
         'xgb_params': {
             'max_depth': 2,
             'n_estimators': 150,
@@ -353,23 +353,23 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ['modis-sst', 'pdo']
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.35, 0.65),
+        'ensemble_weights': (0.90, 0.10),
         'prediction_clip_q': 0.95,
         'prediction_clip_max': None,
     },
 
     'Newport': {
-        # N=142, XGB R²=-0.143 (was -0.28 before Iter 1).
-        # Moderate regularization, more features since N is decent.
-        # Added third grid option (depth=2) for more conservative tuning.
+        # N=142, XGB R²=-0.163, Naive R²=-0.287.
+        # Was -0.28 before Iter 1. Both struggle -- XGB slightly less bad.
+        # Tightened regularization and reduced rolling features for Iter 4.
         'xgb_params': {
             'max_depth': 3,
             'n_estimators': 250,
             'learning_rate': 0.03,
             'min_child_weight': 7,
             'reg_alpha': 0.5,
-            'reg_lambda': 2.0,
-            'gamma': 0.3,
+            'reg_lambda': 3.0,
+            'gamma': 0.5,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
         },
@@ -384,11 +384,11 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
         'feature_subset': (
             PERSISTENCE_FEATURES
             + LAG_FEATURES_FULL
-            + ROLLING_FEATURES_FULL
+            + ROLLING_FEATURES_SHORT
             + ENV_FEATURES_CORE
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.45, 0.55),
+        'ensemble_weights': (0.60, 0.40),
         'prediction_clip_q': 0.98,
         'prediction_clip_max': None,
     },

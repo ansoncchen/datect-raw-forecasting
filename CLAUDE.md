@@ -68,6 +68,11 @@ USE_LOG_TARGET = True          # log(1+DA) transform
 - ✅ Lag features use proper past-only shifts
 - ✅ Fresh model per test point (no lookahead)
 
+## Environment Notes
+
+- **Do not run heavy scripts locally** (validation, comparison, training). These must be run on the compute cluster.
+- Local development is for code editing, review, and lightweight testing only.
+
 ## Outputs
 
 Results saved to `raw_validation_plots/`:
