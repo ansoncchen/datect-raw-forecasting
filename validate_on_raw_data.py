@@ -102,6 +102,9 @@ PARAM_GRID = [
     {"max_depth": 6, "n_estimators": 400, "learning_rate": 0.05, "min_child_weight": 3},
 ]
 
+# Two-stage model (classifier → regressor)
+USE_TWO_STAGE_MODEL = True  # Enable two-stage architecture for better spike detection
+
 # =============================================================================
 # RAW DATA LOADING
 # =============================================================================
@@ -341,35 +344,58 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
         X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
         X_test_processed = transformer.transform(X_test)
         
-        # Train XGBoost on raw targets
-        model = build_xgb_regressor(model_params)
+        # Train model (two-stage or single-stage)
+        spike_probability = None
 
-        # Try early stopping, fall back to regular fit if it fails
-        try:
-            if len(X_train_processed) > 15:  # Need enough samples for 80/20 split
-                val_split = int(0.8 * len(X_train_processed))
-                X_es_train = X_train_processed[:val_split]
-                X_es_val = X_train_processed[val_split:]
-                y_es_train = y_train[:val_split]
-                y_es_val = y_train[val_split:]
-                w_es_train = sample_weight[:val_split] if sample_weight is not None else None
+        if USE_TWO_STAGE_MODEL:
+            # Two-stage architecture: Classifier → Regressor
+            from forecasting.two_stage_model import train_two_stage_model, predict_two_stage
 
-                model.fit(
-                    X_es_train, y_es_train,
-                    sample_weight=w_es_train,
-                    eval_set=[(X_es_val, y_es_val)],
-                    verbose=False
-                )
-            else:
-                # Too few samples for split
+            classifier, reg_spike, reg_normal = train_two_stage_model(
+                X_train_processed, y_train_raw,
+                spike_threshold=SPIKE_THRESHOLD,
+                sample_weight=sample_weight
+            )
+
+            raw_prediction, spike_probability = predict_two_stage(
+                classifier, reg_spike, reg_normal, X_test_processed,
+                spike_threshold=SPIKE_THRESHOLD
+            )
+
+            # Use the normal regressor as 'model' for quantile predictions
+            model = reg_normal
+        else:
+            # Single-stage XGBoost regressor
+            model = build_xgb_regressor(model_params)
+
+            # Try early stopping, fall back to regular fit if it fails
+            try:
+                if len(X_train_processed) > 15:  # Need enough samples for 80/20 split
+                    val_split = int(0.8 * len(X_train_processed))
+                    X_es_train = X_train_processed[:val_split]
+                    X_es_val = X_train_processed[val_split:]
+                    y_es_train = y_train[:val_split]
+                    y_es_val = y_train[val_split:]
+                    w_es_train = sample_weight[:val_split] if sample_weight is not None else None
+
+                    model.fit(
+                        X_es_train, y_es_train,
+                        sample_weight=w_es_train,
+                        eval_set=[(X_es_val, y_es_val)],
+                        verbose=False
+                    )
+                else:
+                    # Too few samples for split
+                    model.fit(X_train_processed, y_train, sample_weight=sample_weight)
+            except Exception:
+                # Early stopping failed, use regular fit
                 model.fit(X_train_processed, y_train, sample_weight=sample_weight)
-        except Exception:
-            # Early stopping failed, use regular fit
-            model.fit(X_train_processed, y_train, sample_weight=sample_weight)
-        
-        # Predict using TEST DATE features
+
+            raw_prediction = float(model.predict(X_test_processed)[0])
+
+        # Postprocess prediction
         def _postprocess_prediction(value: float) -> float:
-            if USE_LOG_TARGET:
+            if USE_LOG_TARGET and not USE_TWO_STAGE_MODEL:
                 value = np.expm1(value)
             value = max(0.0, value)
             if PREDICTION_CLIP_Q is not None:
@@ -377,7 +403,7 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
                 value = min(value, clip_max)
             return float(value)
 
-        prediction = _postprocess_prediction(float(model.predict(X_test_processed)[0]))
+        prediction = _postprocess_prediction(raw_prediction)
 
         quantile_predictions = {}
         if ENABLE_QUANTILE_INTERVALS and not skip_quantiles:
@@ -409,7 +435,7 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
         except Exception:
             pass  # Skip if feature importance extraction fails
 
-        return {
+        result = {
             'test_date': test_date,
             'anchor_date': anchor_date,
             'processed_test_date': test_row['date'].iloc[0],
@@ -421,7 +447,13 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
             'days_ahead': (test_date - anchor_date).days,
             'date_diff_to_processed': int(abs((test_row['date'].iloc[0] - test_date).days)),
             'feature_importance': feature_importance
-        } | quantile_predictions
+        }
+
+        # Add spike probability if using two-stage model
+        if spike_probability is not None:
+            result['spike_probability'] = float(spike_probability)
+
+        return result | quantile_predictions
         
     except Exception as e:
         return None
