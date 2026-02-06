@@ -616,6 +616,17 @@ def run_validation(raw_data, processed_data, n_samples=None):
     )
 
     results_df = pd.DataFrame(results)
+
+    # Add ensemble prediction: weighted average of XGBoost and Naive
+    ENSEMBLE_WEIGHT_XGB = 0.6
+    ENSEMBLE_WEIGHT_NAIVE = 0.4
+    results_df['ensemble_prediction'] = (
+        ENSEMBLE_WEIGHT_XGB * results_df['predicted_da'] +
+        ENSEMBLE_WEIGHT_NAIVE * results_df['naive_prediction']
+    )
+    results_df['ensemble_weight_xgb'] = ENSEMBLE_WEIGHT_XGB
+    results_df['ensemble_weight_naive'] = ENSEMBLE_WEIGHT_NAIVE
+
     return results_df
 
 
@@ -647,16 +658,23 @@ def calculate_metrics(results_df):
     naive_r2 = r2_score(actual, naive)
     naive_mae = mean_absolute_error(actual, naive)
     naive_rmse = np.sqrt(mean_squared_error(actual, naive))
-    
+
+    # Regression metrics - Ensemble
+    if ensemble is not None:
+        ensemble_r2 = r2_score(actual, ensemble)
+        ensemble_mae = mean_absolute_error(actual, ensemble)
+        ensemble_rmse = np.sqrt(mean_squared_error(actual, ensemble))
+    else:
+        ensemble_r2 = None
+        ensemble_mae = None
+        ensemble_rmse = None
+
     # Correlation
     correlation = np.corrcoef(actual, predicted)[0, 1]
     naive_correlation = np.corrcoef(actual, naive)[0, 1]
     ensemble_correlation = np.corrcoef(actual, ensemble)[0, 1] if ensemble is not None else None
 
-    ensemble_r2 = None
-    ensemble_mae = None
-    ensemble_rmse = None
-    ensemble_f1 = None
+    ensemble_f1 = None  # Will be calculated below if ensemble exists
     
     # Spike detection metrics (binary)
     actual_spike = (actual > SPIKE_THRESHOLD).astype(int)
@@ -701,11 +719,8 @@ def calculate_metrics(results_df):
     print(f"  Correlation:           {naive_correlation:.4f}")
 
     if ensemble is not None:
-        ensemble_r2 = r2_score(actual, ensemble)
-        ensemble_mae = mean_absolute_error(actual, ensemble)
-        ensemble_rmse = np.sqrt(mean_squared_error(actual, ensemble))
         print(f"\n{'='*60}")
-        print("ENSEMBLE PERFORMANCE")
+        print("ENSEMBLE PERFORMANCE (0.6*XGB + 0.4*Naive)")
         print(f"{'='*60}")
         print(f"  R² Score:              {ensemble_r2:.4f}")
         print(f"  MAE:                   {ensemble_mae:.4f} μg/g")
