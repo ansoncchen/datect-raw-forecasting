@@ -219,6 +219,16 @@ XGB_REGRESSION_PARAMS = {
     "tree_method": "hist",  # Overridden by ModelFactory based on USE_GPU
 }
 
+# Random Forest Regression parameters
+# RF uses the same feature pipeline as XGBoost. No per-anchor tuning (RF is robust to hyperparams).
+RF_REGRESSION_PARAMS = {
+    "n_estimators": 400,
+    "max_depth": 12,
+    "min_samples_split": 5,
+    "min_samples_leaf": 3,
+    "max_features": 0.85,
+}
+
 # Classification parameters
 XGB_CLASSIFICATION_PARAMS = {
     "n_estimators": 500,

@@ -3,9 +3,10 @@ Per-site model configurations for DATect raw-data DA forecasting.
 
 Each site can override:
   - xgb_params: XGBoost hyperparameter overrides (merged onto base_params)
-  - param_grid: Custom PARAM_GRID for per-anchor tuning (replaces global grid)
+  - rf_params: Random Forest hyperparameter overrides (merged onto RF base_params)
+  - param_grid: Custom PARAM_GRID for per-anchor XGB tuning (replaces global grid)
   - feature_subset: Explicit list of features to keep (None = use all default features)
-  - ensemble_weights: (xgb_weight, naive_weight) tuple (None = use global weights)
+  - ensemble_weights: (xgb_weight, rf_weight, naive_weight) tuple (None = use global)
   - prediction_clip_q: Custom quantile for prediction clipping (None = use global)
   - prediction_clip_max: Hard ceiling on predictions in ug/g (None = no hard ceiling)
 """
@@ -78,6 +79,15 @@ TEMPORAL_FEATURES_FULL = [
     'days_since_start',
 ]
 
+# Conservative RF params for sites where RF R² < 0.1
+RF_CONSERVATIVE = {
+    'n_estimators': 200,
+    'max_depth': 6,
+    'min_samples_split': 10,
+    'min_samples_leaf': 5,
+    'max_features': 0.5,
+}
+
 
 # --------------------------------------------------------------------------
 # Site-specific configuration dictionary
@@ -91,8 +101,8 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
     # ==================================================================
 
     'Copalis': {
-        # N=167, XGB R²=0.732, Naive R²=0.715. Largest site.
-        # Persistence-only features unlocked strong XGB signal (was 0.097 baseline).
+        # N=167, XGB R²=0.732, RF R²=0.765, Naive R²=0.715. Largest site.
+        # All three models strong. Persistence-only features unlocked XGB signal.
         'xgb_params': {
             'max_depth': 2,
             'n_estimators': 100,
@@ -104,6 +114,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.7,
             'colsample_bytree': 0.7,
         },
+        'rf_params': None,  # Global RF defaults work well (R²=0.765)
         'param_grid': [
             {'max_depth': 2, 'n_estimators': 100, 'learning_rate': 0.03,
              'min_child_weight': 10},
@@ -114,14 +125,14 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ROLLING_FEATURES_SHORT
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.55, 0.45),
+        'ensemble_weights': (0.35, 0.30, 0.35),  # (xgb, rf, naive)
         'prediction_clip_q': 0.97,
         'prediction_clip_max': None,
     },
 
     'Kalaloch': {
-        # N=131, XGB R²=0.565, Naive R²=0.669.
-        # Was -1.757 before per-site config. Max regularization + minimal features worked.
+        # N=131, XGB R²=0.565, RF R²=0.679, Naive R²=0.669.
+        # RF excels here. Was XGB R²=-1.757 before per-site config.
         'xgb_params': {
             'max_depth': 2,
             'n_estimators': 80,
@@ -133,6 +144,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.6,
             'colsample_bytree': 0.6,
         },
+        'rf_params': None,  # RF excels here (R²=0.679)
         'param_grid': [
             {'max_depth': 2, 'n_estimators': 80, 'learning_rate': 0.02,
              'min_child_weight': 12},
@@ -142,14 +154,14 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + LAG_FEATURES_SHORT
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.35, 0.65),
+        'ensemble_weights': (0.20, 0.40, 0.40),  # (xgb, rf, naive)
         'prediction_clip_q': 0.95,
         'prediction_clip_max': 80.0,
     },
 
     'Twin Harbors': {
-        # N=138, XGB R²=0.597, Naive R²=0.763.
-        # XGB decent but naive clearly better. Limited env (SST+PDO only).
+        # N=138, XGB R²=0.597, RF R²=0.604, Naive R²=0.763.
+        # Naive dominates, RF close to XGB. Limited env (SST+PDO only).
         'xgb_params': {
             'max_depth': 3,
             'n_estimators': 150,
@@ -161,6 +173,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.8,
             'colsample_bytree': 0.8,
         },
+        'rf_params': None,  # RF decent (R²=0.604)
         'param_grid': [
             {'max_depth': 3, 'n_estimators': 150, 'learning_rate': 0.03,
              'min_child_weight': 8},
@@ -174,14 +187,14 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ['modis-sst', 'pdo']
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.30, 0.70),
+        'ensemble_weights': (0.20, 0.25, 0.55),  # (xgb, rf, naive)
         'prediction_clip_q': 0.98,
         'prediction_clip_max': None,
     },
 
     'Quinault': {
-        # N=113, XGB R²=0.528, Naive R²=0.590.
-        # Modest gap -- keep full env, moderate naive lean.
+        # N=113, XGB R²=0.528, RF R²=0.585, Naive R²=0.590.
+        # All three similar. RF slightly better than XGB.
         'xgb_params': {
             'max_depth': 3,
             'n_estimators': 200,
@@ -193,6 +206,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.8,
             'colsample_bytree': 0.8,
         },
+        'rf_params': None,  # RF good (R²=0.585)
         'param_grid': [
             {'max_depth': 3, 'n_estimators': 200, 'learning_rate': 0.03,
              'min_child_weight': 7},
@@ -206,7 +220,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ENV_FEATURES_CORE
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.40, 0.60),
+        'ensemble_weights': (0.30, 0.30, 0.40),  # (xgb, rf, naive)
         'prediction_clip_q': 0.98,
         'prediction_clip_max': None,
     },
@@ -216,8 +230,8 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
     # ==================================================================
 
     'Long Beach': {
-        # N=140, XGB R²=0.638, Naive R²=0.470.
-        # XGB clearly better -- full features since N supports it.
+        # N=140, XGB R²=0.638, RF R²=0.615, Naive R²=0.470.
+        # XGB and RF both strong, naive trails.
         'xgb_params': {
             'max_depth': 3,
             'n_estimators': 250,
@@ -229,6 +243,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.8,
             'colsample_bytree': 0.8,
         },
+        'rf_params': None,  # RF strong (R²=0.615)
         'param_grid': [
             {'max_depth': 3, 'n_estimators': 250, 'learning_rate': 0.03,
              'min_child_weight': 7},
@@ -242,7 +257,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ENV_FEATURES_CORE
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.65, 0.35),
+        'ensemble_weights': (0.45, 0.35, 0.20),  # (xgb, rf, naive)
         'prediction_clip_q': 0.98,
         'prediction_clip_max': None,
     },
@@ -252,19 +267,20 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
     # ==================================================================
 
     'Clatsop Beach': {
-        # N=218, XGB R²=0.171, Naive R²=-0.015.
-        # XGB clearly better -- global params work well, just adjust ensemble.
+        # N=218, XGB R²=0.171, RF R²=0.238, Naive R²=-0.015.
+        # Both ML models positive, naive near zero. RF slightly better.
         'xgb_params': None,
+        'rf_params': None,  # RF decent (R²=0.238)
         'param_grid': None,
         'feature_subset': None,
-        'ensemble_weights': (0.80, 0.20),
+        'ensemble_weights': (0.50, 0.40, 0.10),  # (xgb, rf, naive)
         'prediction_clip_q': None,
         'prediction_clip_max': None,
     },
 
     'Coos Bay': {
-        # N=67, XGB R²=0.337, Naive R²=-0.570.
-        # XGB much better than naive. Near-pure XGB ensemble.
+        # N=67, XGB R²=0.337, RF R²=0.042, Naive R²=-0.570.
+        # XGB dominates. RF weak, naive catastrophic.
         'xgb_params': {
             'max_depth': 3,
             'n_estimators': 200,
@@ -276,6 +292,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.8,
             'colsample_bytree': 0.8,
         },
+        'rf_params': dict(RF_CONSERVATIVE),  # Conservative: RF weak here
         'param_grid': [
             {'max_depth': 3, 'n_estimators': 200, 'learning_rate': 0.03,
              'min_child_weight': 7},
@@ -289,7 +306,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ENV_FEATURES_CORE
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.90, 0.10),
+        'ensemble_weights': (0.80, 0.10, 0.10),  # (xgb, rf, naive)
         'prediction_clip_q': 0.97,
         'prediction_clip_max': None,
     },
@@ -300,8 +317,8 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
     # ==================================================================
 
     'Cannon Beach': {
-        # N=61 (smallest), XGB R²=-0.257, Naive R²=-10.663.
-        # Was -44 before Iter 1. Naive is catastrophic -- near-pure XGB ensemble.
+        # N=61 (smallest), XGB R²=-0.257, RF R²=-0.519, Naive R²=-10.663.
+        # Was -44 before Iter 1. All models struggle. XGB least bad.
         'xgb_params': {
             'max_depth': 2,
             'n_estimators': 100,
@@ -313,6 +330,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.7,
             'colsample_bytree': 0.7,
         },
+        'rf_params': dict(RF_CONSERVATIVE),  # Conservative: RF terrible here
         'param_grid': [
             {'max_depth': 2, 'n_estimators': 80, 'learning_rate': 0.02,
              'min_child_weight': 12},
@@ -323,14 +341,14 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + TEMPORAL_FEATURES_CORE
             + ['modis-sst', 'pdo']
         ),
-        'ensemble_weights': (0.95, 0.05),
+        'ensemble_weights': (0.85, 0.05, 0.10),  # (xgb, rf, naive)
         'prediction_clip_q': 0.95,
         'prediction_clip_max': 80.0,
     },
 
     'Gold Beach': {
-        # N=144, XGB R²=-0.094, Naive R²=-1.656.
-        # Was -0.94 before Iter 1. Naive is terrible -- near-pure XGB ensemble.
+        # N=144, XGB R²=-0.094, RF R²=-0.107, Naive R²=-1.656.
+        # Was -0.94 before Iter 1. Both ML models slightly negative.
         'xgb_params': {
             'max_depth': 2,
             'n_estimators': 150,
@@ -342,6 +360,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.7,
             'colsample_bytree': 0.7,
         },
+        'rf_params': dict(RF_CONSERVATIVE),  # Conservative: RF poor here
         'param_grid': [
             {'max_depth': 2, 'n_estimators': 150, 'learning_rate': 0.03,
              'min_child_weight': 10},
@@ -353,15 +372,14 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ['modis-sst', 'pdo']
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.90, 0.10),
+        'ensemble_weights': (0.80, 0.10, 0.10),  # (xgb, rf, naive)
         'prediction_clip_q': 0.95,
         'prediction_clip_max': None,
     },
 
     'Newport': {
-        # N=142, XGB R²=-0.163, Naive R²=-0.287.
-        # Was -0.28 before Iter 1. Both struggle -- XGB slightly less bad.
-        # Tightened regularization and reduced rolling features for Iter 4.
+        # N=142, XGB R²=-0.127, RF R²=-0.166, Naive R²=-0.287.
+        # All struggle. XGB slightly less bad. Tightened regularization in Iter 4.
         'xgb_params': {
             'max_depth': 3,
             'n_estimators': 250,
@@ -373,6 +391,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.8,
             'colsample_bytree': 0.8,
         },
+        'rf_params': dict(RF_CONSERVATIVE),  # Conservative: RF poor here
         'param_grid': [
             {'max_depth': 3, 'n_estimators': 250, 'learning_rate': 0.03,
              'min_child_weight': 7},
@@ -388,7 +407,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             + ENV_FEATURES_CORE
             + TEMPORAL_FEATURES_CORE
         ),
-        'ensemble_weights': (0.60, 0.40),
+        'ensemble_weights': (0.55, 0.15, 0.30),  # (xgb, rf, naive)
         'prediction_clip_q': 0.98,
         'prediction_clip_max': None,
     },
@@ -401,6 +420,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
 
 DEFAULT_SITE_CONFIG: Dict[str, Any] = {
     'xgb_params': None,
+    'rf_params': None,
     'param_grid': None,
     'feature_subset': None,
     'ensemble_weights': None,
@@ -428,17 +448,28 @@ def apply_site_xgb_params(base_params: dict, site: str) -> dict:
     return {**base_params, **site_cfg['xgb_params']}
 
 
+def apply_site_rf_params(base_params: dict, site: str) -> dict:
+    """Merge site-specific RF params onto global base_params."""
+    site_cfg = get_site_config(site)
+    if site_cfg['rf_params'] is None:
+        return dict(base_params)
+    return {**base_params, **site_cfg['rf_params']}
+
+
 def get_site_param_grid(site: str) -> Optional[List[dict]]:
     """Return site-specific PARAM_GRID, or None to use global grid."""
     return get_site_config(site)['param_grid']
 
 
-def get_site_ensemble_weights(site: str) -> Tuple[float, float]:
-    """Return (xgb_weight, naive_weight) for this site. Default: (0.65, 0.35)."""
+def get_site_ensemble_weights(site: str) -> Tuple[float, float, float]:
+    """Return (xgb_weight, rf_weight, naive_weight) for this site.
+
+    Default: (0.50, 0.15, 0.35).
+    """
     weights = get_site_config(site)['ensemble_weights']
     if weights is not None:
         return weights
-    return (0.65, 0.35)
+    return (0.50, 0.15, 0.35)
 
 
 def get_site_clip_params(site: str) -> Tuple[Optional[float], Optional[float]]:

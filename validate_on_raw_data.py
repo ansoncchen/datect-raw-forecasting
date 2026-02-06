@@ -37,7 +37,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import config
-from forecasting.model_factory import build_xgb_regressor
+from forecasting.model_factory import build_xgb_regressor, build_rf_regressor
 from forecasting.raw_data_forecaster import (
     aggregate_raw_to_weekly,
     build_raw_feature_frame,
@@ -49,6 +49,7 @@ from forecasting.raw_data_forecaster import (
 from forecasting.sample_weights import compute_spike_focused_weights
 from forecasting.per_site_models import (
     apply_site_xgb_params,
+    apply_site_rf_params,
     get_site_param_grid,
     get_site_ensemble_weights,
     get_site_clip_params,
@@ -273,7 +274,7 @@ def create_transformer(df, drop_cols):
 # VALIDATION LOGIC - MATCHING ORIGINAL PIPELINE
 # =============================================================================
 
-def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip_quantiles=False):
+def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip_quantiles=False, skip_rf=False):
     """
     Validate a single raw measurement using the EXACT approach from forecast_engine.py.
     
@@ -433,6 +434,24 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
 
         prediction = _postprocess_prediction(raw_prediction)
 
+        # --- Random Forest (same features, no tuning, no early stopping) ---
+        rf_prediction = None
+        if not skip_rf:
+            try:
+                import config as _cfg
+                rf_base_params = dict(_cfg.RF_REGRESSION_PARAMS)
+                if USE_PER_SITE_MODELS:
+                    rf_effective_params = apply_site_rf_params(rf_base_params, site)
+                else:
+                    rf_effective_params = rf_base_params
+                rf_model = build_rf_regressor(rf_effective_params)
+                rf_model.fit(X_train_processed, y_train)
+                rf_raw_prediction = float(rf_model.predict(X_test_processed)[0])
+                rf_prediction = _postprocess_prediction(rf_raw_prediction)
+            except Exception:
+                rf_prediction = prediction  # Fallback to XGB if RF fails
+
+
         quantile_predictions = {}
         if ENABLE_QUANTILE_INTERVALS and not skip_quantiles:
             try:
@@ -470,6 +489,7 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
             'site': site,
             'actual_da_raw': actual_da,
             'predicted_da': prediction,
+            'predicted_da_rf': rf_prediction if rf_prediction is not None else prediction,
             'naive_prediction': naive_prediction,
             'training_samples': len(train_data),
             'days_ahead': (test_date - anchor_date).days,
@@ -560,8 +580,9 @@ def tune_xgb_params(calib_rows, feature_frame, base_params, param_grid_override=
         params = {**base_params, **override}
         # Run sequentially to avoid nested parallelization
         # skip_quantiles=True: quantile models aren't needed for tuning (only R² matters)
+        # skip_rf=True: RF not needed for XGB tuning (saves ~15% compute)
         results = [
-            run_single_raw_validation(row, feature_frame, params, skip_quantiles=True)
+            run_single_raw_validation(row, feature_frame, params, skip_quantiles=True, skip_rf=True)
             for row in calib_rows
         ]
         results = [r for r in results if r is not None]
@@ -728,30 +749,40 @@ def run_validation(raw_data, processed_data, n_samples=None):
 
     results_df = pd.DataFrame(results)
 
-    # Add ensemble prediction only if we have predictions
+    # Add ensemble prediction only if we have predictions (3-model: XGB + RF + Naive)
     if not results_df.empty and 'predicted_da' in results_df.columns and 'naive_prediction' in results_df.columns:
         if USE_PER_SITE_MODELS:
-            # Per-site ensemble weights
+            # Per-site 3-model ensemble weights
             ensemble_preds = []
             xgb_weights = []
+            rf_weights = []
             naive_weights = []
             for _, row in results_df.iterrows():
-                w_xgb, w_naive = get_site_ensemble_weights(row['site'])
-                ensemble_preds.append(w_xgb * row['predicted_da'] + w_naive * row['naive_prediction'])
+                w_xgb, w_rf, w_naive = get_site_ensemble_weights(row['site'])
+                rf_pred = row.get('predicted_da_rf', row['predicted_da'])
+                ensemble_preds.append(
+                    w_xgb * row['predicted_da'] + w_rf * rf_pred + w_naive * row['naive_prediction']
+                )
                 xgb_weights.append(w_xgb)
+                rf_weights.append(w_rf)
                 naive_weights.append(w_naive)
             results_df['ensemble_prediction'] = ensemble_preds
             results_df['ensemble_weight_xgb'] = xgb_weights
+            results_df['ensemble_weight_rf'] = rf_weights
             results_df['ensemble_weight_naive'] = naive_weights
         else:
-            # Global ensemble weights
-            ENSEMBLE_WEIGHT_XGB = 0.65
+            # Global 3-model ensemble weights
+            ENSEMBLE_WEIGHT_XGB = 0.50
+            ENSEMBLE_WEIGHT_RF = 0.15
             ENSEMBLE_WEIGHT_NAIVE = 0.35
+            rf_preds = results_df.get('predicted_da_rf', results_df['predicted_da'])
             results_df['ensemble_prediction'] = (
                 ENSEMBLE_WEIGHT_XGB * results_df['predicted_da'] +
+                ENSEMBLE_WEIGHT_RF * rf_preds +
                 ENSEMBLE_WEIGHT_NAIVE * results_df['naive_prediction']
             )
             results_df['ensemble_weight_xgb'] = ENSEMBLE_WEIGHT_XGB
+            results_df['ensemble_weight_rf'] = ENSEMBLE_WEIGHT_RF
             results_df['ensemble_weight_naive'] = ENSEMBLE_WEIGHT_NAIVE
 
     # Aggregate and analyze feature importance
@@ -814,14 +845,24 @@ def calculate_metrics(results_df):
     
     actual = results_df['actual_da_raw'].values
     predicted = results_df['predicted_da'].values
+    rf_predicted = results_df['predicted_da_rf'].values if 'predicted_da_rf' in results_df else None
     naive = results_df['naive_prediction'].values
     ensemble = results_df['ensemble_prediction'].values if 'ensemble_prediction' in results_df else None
-    
+
     # Regression metrics - XGBoost
     r2 = r2_score(actual, predicted)
     mae = mean_absolute_error(actual, predicted)
     rmse = np.sqrt(mean_squared_error(actual, predicted))
-    
+
+    # Regression metrics - Random Forest
+    if rf_predicted is not None:
+        rf_r2 = r2_score(actual, rf_predicted)
+        rf_mae = mean_absolute_error(actual, rf_predicted)
+        rf_rmse = np.sqrt(mean_squared_error(actual, rf_predicted))
+        rf_correlation = np.corrcoef(actual, rf_predicted)[0, 1]
+    else:
+        rf_r2 = rf_mae = rf_rmse = rf_correlation = None
+
     # Regression metrics - Naive baseline (last known value)
     naive_r2 = r2_score(actual, naive)
     naive_mae = mean_absolute_error(actual, naive)
@@ -843,18 +884,27 @@ def calculate_metrics(results_df):
     ensemble_correlation = np.corrcoef(actual, ensemble)[0, 1] if ensemble is not None else None
 
     ensemble_f1 = None  # Will be calculated below if ensemble exists
-    
+    rf_f1 = None
+
     # Spike detection metrics (binary)
     actual_spike = (actual > SPIKE_THRESHOLD).astype(int)
     predicted_spike = (predicted > SPIKE_THRESHOLD).astype(int)
+    rf_spike = (rf_predicted > SPIKE_THRESHOLD).astype(int) if rf_predicted is not None else None
     naive_spike = (naive > SPIKE_THRESHOLD).astype(int)
     ensemble_spike = (ensemble > SPIKE_THRESHOLD).astype(int) if ensemble is not None else None
-    
+
     if actual_spike.sum() > 0:
         precision = precision_score(actual_spike, predicted_spike, zero_division=0)
         recall = recall_score(actual_spike, predicted_spike, zero_division=0)
         f1 = f1_score(actual_spike, predicted_spike, zero_division=0)
-        
+
+        if rf_spike is not None:
+            rf_precision = precision_score(actual_spike, rf_spike, zero_division=0)
+            rf_recall = recall_score(actual_spike, rf_spike, zero_division=0)
+            rf_f1 = f1_score(actual_spike, rf_spike, zero_division=0)
+        else:
+            rf_precision = rf_recall = rf_f1 = 0.0
+
         naive_precision = precision_score(actual_spike, naive_spike, zero_division=0)
         naive_recall = recall_score(actual_spike, naive_spike, zero_division=0)
         naive_f1 = f1_score(actual_spike, naive_spike, zero_division=0)
@@ -866,6 +916,7 @@ def calculate_metrics(results_df):
             ensemble_precision = ensemble_recall = ensemble_f1 = 0.0
     else:
         precision = recall = f1 = 0.0
+        rf_precision = rf_recall = rf_f1 = 0.0
         naive_precision = naive_recall = naive_f1 = 0.0
         ensemble_precision = ensemble_recall = ensemble_f1 = 0.0
     
@@ -878,6 +929,15 @@ def calculate_metrics(results_df):
     print(f"  RMSE:                  {rmse:.4f} μg/g")
     print(f"  Correlation:           {correlation:.4f}")
     
+    if rf_predicted is not None:
+        print(f"\n{'='*60}")
+        print("RANDOM FOREST PERFORMANCE")
+        print(f"{'='*60}")
+        print(f"  R² Score:              {rf_r2:.4f}")
+        print(f"  MAE:                   {rf_mae:.4f} μg/g")
+        print(f"  RMSE:                  {rf_rmse:.4f} μg/g")
+        print(f"  Correlation:           {rf_correlation:.4f}")
+
     print(f"\n{'='*60}")
     print("NAIVE BASELINE PERFORMANCE (Last Known DA Value)")
     print(f"{'='*60}")
@@ -888,7 +948,7 @@ def calculate_metrics(results_df):
 
     if ensemble is not None:
         print(f"\n{'='*60}")
-        print("ENSEMBLE PERFORMANCE (0.65*XGB + 0.35*Naive)")
+        print("ENSEMBLE PERFORMANCE (XGB+RF+Naive)")
         print(f"{'='*60}")
         print(f"  R² Score:              {ensemble_r2:.4f}")
         print(f"  MAE:                   {ensemble_mae:.4f} μg/g")
@@ -912,6 +972,13 @@ def calculate_metrics(results_df):
     print(f"    Precision:           {precision:.4f}")
     print(f"    Recall:              {recall:.4f}")
     print(f"    F1 Score:            {f1:.4f}")
+    if rf_spike is not None:
+        print(f"")
+        print(f"  Random Forest:")
+        print(f"    Predicted spikes:    {rf_spike.sum()} ({100*rf_spike.mean():.1f}%)")
+        print(f"    Precision:           {rf_precision:.4f}")
+        print(f"    Recall:              {rf_recall:.4f}")
+        print(f"    F1 Score:            {rf_f1:.4f}")
     print(f"")
     print(f"  Naive Baseline:")
     print(f"    Predicted spikes:    {naive_spike.sum()} ({100*naive_spike.mean():.1f}%)")
@@ -931,32 +998,56 @@ def calculate_metrics(results_df):
     print(f"\n{'='*60}")
     print("SITE-SPECIFIC PERFORMANCE")
     print(f"{'='*60}")
-    print(f"{'Site':<20} {'N':>4} {'XGB R²':>8} {'Naive R²':>9} {'XGB MAE':>8} {'Naive MAE':>10}")
-    print("-"*70)
-    
+    has_rf_col = 'predicted_da_rf' in results_df.columns
+    has_ens_col = 'ensemble_prediction' in results_df.columns
+    if has_rf_col:
+        print(f"{'Site':<20} {'N':>4} {'XGB R²':>8} {'RF R²':>7} {'Naive R²':>9} {'Ens R²':>8} {'XGB MAE':>8} {'Naive MAE':>10}")
+        print("-"*86)
+    else:
+        print(f"{'Site':<20} {'N':>4} {'XGB R²':>8} {'Naive R²':>9} {'XGB MAE':>8} {'Naive MAE':>10}")
+        print("-"*70)
+
     site_metrics = {}
     for site in sorted(results_df['site'].unique()):
         site_results = results_df[results_df['site'] == site]
         site_actual = site_results['actual_da_raw'].values
         site_pred = site_results['predicted_da'].values
         site_naive = site_results['naive_prediction'].values
-        
+
         if len(site_actual) >= 5:  # Need enough samples
             site_r2 = r2_score(site_actual, site_pred)
             site_mae = mean_absolute_error(site_actual, site_pred)
             site_naive_r2 = r2_score(site_actual, site_naive)
             site_naive_mae = mean_absolute_error(site_actual, site_naive)
-            
+
             site_actual_spike = (site_actual > SPIKE_THRESHOLD).astype(int)
             site_pred_spike = (site_pred > SPIKE_THRESHOLD).astype(int)
             site_f1 = f1_score(site_actual_spike, site_pred_spike, zero_division=0)
-            
-            print(f"{site:<20} {len(site_results):>4} {site_r2:>+8.3f} {site_naive_r2:>+9.3f} {site_mae:>8.2f} {site_naive_mae:>10.2f}")
-            
+
+            if has_rf_col:
+                site_rf_pred = site_results['predicted_da_rf'].values
+                site_rf_r2 = r2_score(site_actual, site_rf_pred)
+            else:
+                site_rf_r2 = None
+
+            if has_ens_col:
+                site_ens_pred = site_results['ensemble_prediction'].values
+                site_ens_r2 = r2_score(site_actual, site_ens_pred)
+            else:
+                site_ens_r2 = None
+
+            if has_rf_col:
+                ens_str = f"{site_ens_r2:>+8.3f}" if site_ens_r2 is not None else f"{'N/A':>8}"
+                print(f"{site:<20} {len(site_results):>4} {site_r2:>+8.3f} {site_rf_r2:>+7.3f} {site_naive_r2:>+9.3f} {ens_str} {site_mae:>8.2f} {site_naive_mae:>10.2f}")
+            else:
+                print(f"{site:<20} {len(site_results):>4} {site_r2:>+8.3f} {site_naive_r2:>+9.3f} {site_mae:>8.2f} {site_naive_mae:>10.2f}")
+
             site_metrics[site] = {
                 'n': len(site_results),
                 'r2': site_r2,
+                'rf_r2': site_rf_r2,
                 'naive_r2': site_naive_r2,
+                'ensemble_r2': site_ens_r2,
                 'mae': site_mae,
                 'naive_mae': site_naive_mae,
                 'f1': site_f1
@@ -982,9 +1073,16 @@ def calculate_metrics(results_df):
         'f1': f1,
         'precision': precision,
         'recall': recall,
+        'rf_r2': rf_r2,
+        'rf_mae': rf_mae,
+        'rf_rmse': rf_rmse,
+        'rf_f1': rf_f1,
         'naive_r2': naive_r2,
         'naive_mae': naive_mae,
         'naive_f1': naive_f1,
+        'ensemble_r2': ensemble_r2,
+        'ensemble_mae': ensemble_mae,
+        'ensemble_f1': ensemble_f1,
         'n_samples': len(results_df),
         'n_spikes': int(actual_spike.sum()),
         'site_metrics': site_metrics
@@ -1415,7 +1513,9 @@ def save_results(results_df, metrics, output_dir):
         f.write(f"  Parallel enabled: {ENABLE_PARALLEL} (n_jobs={N_JOBS})\n")
         f.write(f"  Per-anchor calibration fraction: {CALIBRATION_FRACTION}\n")
         if "ensemble_weight_naive" in results_df.columns:
-            f.write(f"  Ensemble weight (naive): {results_df['ensemble_weight_naive'].iloc[0]:.2f}\n")
+            f.write(f"  Ensemble weights: XGB={results_df['ensemble_weight_xgb'].iloc[0]:.2f}, "
+                    f"RF={results_df['ensemble_weight_rf'].iloc[0]:.2f}, "
+                    f"Naive={results_df['ensemble_weight_naive'].iloc[0]:.2f}\n")
         f.write("\n")
         
         f.write("CRITICAL: Uses test-date environmental features (matching original pipeline)\n\n")

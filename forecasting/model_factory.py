@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from sklearn.ensemble import RandomForestRegressor
 from xgboost import XGBClassifier, XGBRegressor
 
 import config
@@ -31,6 +32,16 @@ def build_xgb_regressor(param_overrides: Optional[dict] = None) -> XGBRegressor:
     params.pop("tree_method", None)
     params.update(_resolve_xgb_device_params())
     return XGBRegressor(**params, random_state=config.RANDOM_SEED, verbosity=0)
+
+
+def build_rf_regressor(param_overrides: Optional[dict] = None) -> RandomForestRegressor:
+    """
+    Build a Random Forest regressor with config defaults.
+    """
+    base_params = dict(config.RF_REGRESSION_PARAMS)
+    params = {**base_params, **(param_overrides or {})}
+    params["n_jobs"] = 1  # Avoid nested parallelism with joblib
+    return RandomForestRegressor(**params, random_state=config.RANDOM_SEED)
 
 
 def build_xgb_classifier(param_overrides: Optional[dict] = None) -> XGBClassifier:
