@@ -113,7 +113,7 @@ PARAM_GRID = [
 USE_TWO_STAGE_MODEL = False  # DISABLED - tested both architectures, single-stage performs better (R²=0.224 vs 0.100)
 
 # Per-site model configurations (Phase 9)
-USE_PER_SITE_MODELS = False  # Enable site-specific XGB params, features, ensemble weights
+USE_PER_SITE_MODELS = True  # Enable site-specific XGB params, features, ensemble weights
 
 # =============================================================================
 # RAW DATA LOADING
@@ -530,9 +530,17 @@ def run_single_raw_validation_with_tuning(raw_measurement, feature_frame, base_p
     if len(calib_rows) < 2:
         return run_single_raw_validation(raw_measurement, feature_frame, effective_base_params, skip_quantiles=False)
 
-    # Use site-specific PARAM_GRID if available
-    site_grid = get_site_param_grid(site) if USE_PER_SITE_MODELS else None
-    best_params, _ = tune_xgb_params(calib_rows, feature_frame, effective_base_params, param_grid_override=site_grid)
+    # Use site-specific PARAM_GRID if available, merged with global grid as fallback
+    if USE_PER_SITE_MODELS:
+        site_grid = get_site_param_grid(site)
+        if site_grid is not None:
+            # Merge: site-specific entries first (preferred), then global fallbacks
+            merged_grid = list(site_grid) + [g for g in PARAM_GRID if g not in site_grid]
+        else:
+            merged_grid = None
+    else:
+        merged_grid = None
+    best_params, _ = tune_xgb_params(calib_rows, feature_frame, effective_base_params, param_grid_override=merged_grid)
     result = run_single_raw_validation(raw_measurement, feature_frame, best_params)
     return result  # No calibration - removed circular optimization
 
