@@ -339,27 +339,30 @@ def run_single_raw_validation(raw_measurement, feature_frame, model_params, skip
         X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
         X_test_processed = transformer.transform(X_test)
         
-        # Train XGBoost on raw targets with early stopping
+        # Train XGBoost on raw targets
         model = build_xgb_regressor(model_params)
 
-        # Split training data: 80% train, 20% validation for early stopping
-        if len(X_train_processed) > 10:
-            val_split = int(0.8 * len(X_train_processed))
-            X_es_train = X_train_processed[:val_split]
-            X_es_val = X_train_processed[val_split:]
-            y_es_train = y_train[:val_split]
-            y_es_val = y_train[val_split:]
-            w_es_train = sample_weight[:val_split] if sample_weight is not None else None
+        # Try early stopping, fall back to regular fit if it fails
+        try:
+            if len(X_train_processed) > 15:  # Need enough samples for 80/20 split
+                val_split = int(0.8 * len(X_train_processed))
+                X_es_train = X_train_processed[:val_split]
+                X_es_val = X_train_processed[val_split:]
+                y_es_train = y_train[:val_split]
+                y_es_val = y_train[val_split:]
+                w_es_train = sample_weight[:val_split] if sample_weight is not None else None
 
-            model.fit(
-                X_es_train, y_es_train,
-                sample_weight=w_es_train,
-                eval_set=[(X_es_val, y_es_val)],
-                early_stopping_rounds=50,
-                verbose=False
-            )
-        else:
-            # Too few samples for early stopping split
+                model.fit(
+                    X_es_train, y_es_train,
+                    sample_weight=w_es_train,
+                    eval_set=[(X_es_val, y_es_val)],
+                    verbose=False
+                )
+            else:
+                # Too few samples for split
+                model.fit(X_train_processed, y_train, sample_weight=sample_weight)
+        except Exception:
+            # Early stopping failed, use regular fit
             model.fit(X_train_processed, y_train, sample_weight=sample_weight)
         
         # Predict using TEST DATE features
@@ -636,16 +639,17 @@ def run_validation(raw_data, processed_data, n_samples=None):
 
     results_df = pd.DataFrame(results)
 
-    # Add ensemble prediction: weighted average of XGBoost and Naive
-    # Favor naive more to improve MAE while keeping XGB's high recall
-    ENSEMBLE_WEIGHT_XGB = 0.35
-    ENSEMBLE_WEIGHT_NAIVE = 0.65
-    results_df['ensemble_prediction'] = (
-        ENSEMBLE_WEIGHT_XGB * results_df['predicted_da'] +
-        ENSEMBLE_WEIGHT_NAIVE * results_df['naive_prediction']
-    )
-    results_df['ensemble_weight_xgb'] = ENSEMBLE_WEIGHT_XGB
-    results_df['ensemble_weight_naive'] = ENSEMBLE_WEIGHT_NAIVE
+    # Add ensemble prediction only if we have predictions
+    if not results_df.empty and 'predicted_da' in results_df.columns and 'naive_prediction' in results_df.columns:
+        # Favor naive more to improve MAE while keeping XGB's high recall
+        ENSEMBLE_WEIGHT_XGB = 0.35
+        ENSEMBLE_WEIGHT_NAIVE = 0.65
+        results_df['ensemble_prediction'] = (
+            ENSEMBLE_WEIGHT_XGB * results_df['predicted_da'] +
+            ENSEMBLE_WEIGHT_NAIVE * results_df['naive_prediction']
+        )
+        results_df['ensemble_weight_xgb'] = ENSEMBLE_WEIGHT_XGB
+        results_df['ensemble_weight_naive'] = ENSEMBLE_WEIGHT_NAIVE
 
     return results_df
 
