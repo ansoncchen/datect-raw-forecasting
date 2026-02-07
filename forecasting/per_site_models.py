@@ -291,7 +291,7 @@ SITE_SPECIFIC_CONFIGS: Dict[str, Dict[str, Any]] = {
             'subsample': 0.8,
             'colsample_bytree': 0.8,
         },
-        'rf_params': None,  # RF is strong here now — use full params, not conservative
+        'rf_params': dict(RF_CONSERVATIVE),  # N=67 too small for full RF — overfits
         'param_grid': [
             {'max_depth': 3, 'n_estimators': 200, 'learning_rate': 0.03,
              'min_child_weight': 7},

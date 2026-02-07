@@ -263,10 +263,22 @@ ENABLE_QUANTILE_INTERVALS = True
 # History requirement: anchor must have >= this fraction of site's total history
 HISTORY_REQUIREMENT_FRACTION = 0.33
 
-# Zero-importance features to always drop (identified in Phase 4)
+# Zero/near-zero importance features to always drop.
+# Original Phase 4 drops + 8 features confirmed < 1% of max importance
+# in leak-free pipeline (Iter 6 feature importance analysis).
 ZERO_IMPORTANCE_FEATURES = [
+    # Phase 4 original drops
     'lat', 'lon', 'weeks_since_last_raw',
     'is_bloom_season', 'quarter',
+    # Leak-free feature importance < 1% of max (0.0037 threshold)
+    'raw_obs_roll_mean_12',
+    'modis-par',
+    'raw_obs_roll_mean_8',
+    'sin_week_of_year',
+    'cos_month',
+    'modis-k490',
+    'cos_week_of_year',
+    'da_raw_prev_obs_4_weeks_ago',
 ]
 
 # Output directory for validation plots
